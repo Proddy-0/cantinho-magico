@@ -7,59 +7,54 @@ Blog de fã sobre **Disney**, **BTS** e **Fórmula 1**, com:
 - 💜 **Contador em cada categoria**: a página do BTS conta os dias pro show no Brasil, a da F1 pra próxima corrida etc.
 - ✏️ **Painel admin** (`admin.html`) com login por usuário e senha para escrever, editar e excluir posts.
 
-Site 100% estático (HTML + CSS + JS) no **GitHub Pages**, com domínio próprio pela Cloudflare.
+## 🧱 Como funciona
+
+- **Site** (HTML + CSS + JS): hospedado no **GitHub Pages**, com domínio `baiana.proddyt.com` pela Cloudflare.
+- **API** (`worker/`): um **Cloudflare Worker** em `baiana.proddyt.com/api/*` que guarda no **KV** os posts, imagens, cronômetro e logins.
+- O painel admin só fala com a API. **Não precisa de GitHub nem de chave nenhuma** pra escrever posts.
 
 ## 📁 Estrutura
 
 ```
-index.html        → o site
-admin.html        → painel admin (login com usuário e senha)
-setup.html        → configuração inicial e renovação da chave do GitHub (só o dono, sem link no site)
-CNAME             → domínio (baiana.proddyt.com)
-data/posts.json   → os posts (o painel edita sozinho)
-data/site.json    → cronômetro de lançamento (o painel edita sozinho)
-data/access.json  → acessos do painel, criptografados (o painel edita sozinho)
-img/              → imagens enviadas pelo painel (figurinhas em img/stickers/)
-js/config.js      → nome do site, ícones das categorias e eventos dos cronômetros  ← EDITE AQUI
-js/app.js         → lógica do site
-js/admin.js       → lógica do painel admin
-js/markdown.js    → formatação do texto dos posts
-css/style.css     → cores e visual
+index.html          → o site
+admin.html          → painel admin (login com usuário e senha)
+CNAME               → domínio (baiana.proddyt.com)
+js/config.js        → nome do site, ícones das categorias e eventos dos cronômetros  ← EDITE AQUI
+js/app.js           → lógica do site
+js/admin.js         → lógica do painel admin
+js/markdown.js      → formatação do texto dos posts
+css/style.css       → cores e visual
+worker/src/index.js → API (login, posts, imagens, cronômetro, pessoas)
+worker/wrangler.toml→ configuração do Worker (rota e KV)
+worker/seed/        → posts e cronômetro iniciais (usados só na primeira carga do KV)
 ```
 
-## 🔄 Deploy (CI/CD)
+## 🔄 Deploy
 
-O GitHub Pages publica sozinho **a cada push na branch `main`**, inclusive as mudanças feitas pelo painel admin.
-Leva cerca de 1 minuto. Dá pra acompanhar em **Actions → pages-build-deployment** no repositório.
+- **Site:** o GitHub Pages publica sozinho a cada `git push` na `main` (~1 minuto).
+- **API:** quando mudar algo em `worker/`:
 
 ```bash
-git push
+cd worker && npx wrangler deploy
 ```
+
+Posts, imagens, senhas e cronômetro **não** passam pelo git: o painel salva direto na API, e aparece no site na hora.
 
 ## ✏️ Painel admin
 
 Acesse **https://baiana.proddyt.com/admin.html**. O site não mostra link pro painel pra visitantes: o link **✏️ Admin** só aparece no menu pra quem está logado.
 
-### Configuração inicial (dono do site, uma vez só)
+### Usuários
 
-Fica numa página separada, sem link no site: **https://baiana.proddyt.com/setup.html**. Já vem preenchida com os usuários **aysllan** e **bia** e a senha provisória **123mudar**.
+Já vêm criados: **aysllan** e **bia**, com a senha provisória **123mudar**.
+No primeiro login o painel pede uma **senha nova**, que fica registrada. A provisória para de funcionar.
 
-1. Crie uma chave em [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new):
-   - **Repository access** → *Only select repositories* → `cantinho-magico`
-   - **Permissions → Repository permissions → Contents** → *Read and write*
-2. Cole a chave no `setup.html` e clique em **Salvar acessos**.
-3. Cada pessoa entra no `admin.html` com o usuário e `123mudar`. **No primeiro login o painel pede uma senha nova**, que fica registrada.
-4. Quando todo mundo tiver criado a própria senha, o `setup.html` avisa: renove a chave do GitHub lá (crie uma nova, cole, e apague a antiga no GitHub).
+### Segurança
 
-O repositório (`Proddy-0/cantinho-magico`) fica fixo em `js/config.js` → `github`.
-
-### Como fica seguro sem servidor
-
-- Cada pessoa tem um **par de chaves** próprio. A chave privada fica criptografada com a senha dela (PBKDF2 com 600 mil rodadas + AES-256).
-- A chave do GitHub fica trancada com a chave pública de cada pessoa. Só quem sabe a senha consegue destrancar.
-- `data/access.json` não guarda nenhuma senha nem a chave do GitHub em texto aberto.
-- A senha provisória fica no histórico do git. Por isso o passo 4 (renovar a chave depois que todos trocarem a senha) é importante: assim o que ficou no histórico não serve pra mais nada.
-- Renovar a chave do GitHub (quando vencer, ou por segurança) **não exige** que ninguém troque a senha.
+- A senha não sai do navegador: ele manda só um derivado dela (PBKDF2 com 600 mil rodadas), e a API guarda um hash desse derivado.
+- Com a senha provisória, o único passo liberado é criar a senha nova.
+- Depois de 10 senhas erradas, o usuário fica bloqueado por 15 minutos.
+- Login dura 30 dias ("Continuar conectado") ou até fechar o navegador.
 
 ### No painel dá pra
 
@@ -69,11 +64,9 @@ O repositório (`Proddy-0/cantinho-magico`) fica fixo em `js/config.js` → `git
 - **🚀 Cronômetro de lançamento**: ligar/desligar, data e hora de abertura (horário de Brasília), título e mensagem,
 - **👥 Quem pode entrar**: adicionar pessoa (com senha provisória), resetar senha, remover, trocar a própria senha.
 
-A chave do GitHub não aparece no painel: configuração e renovação ficam só no `setup.html`.
-
 ## 🚀 Cronômetro de lançamento
 
-Configurado pelo painel (salvo em `data/site.json`). Hoje está **desligado**, com data de domingo **01/11/2026 às 20h**.
+Configurado pelo painel. Hoje está **desligado**, com data de domingo **01/11/2026 às 20h**.
 
 - Ligado: o site fica fechado mostrando só a contagem regressiva e abre sozinho quando zera.
 - Pra ver o site enquanto está fechado: **https://baiana.proddyt.com/?preview**
@@ -122,10 +115,14 @@ Em `js/config.js`, na lista `events`:
 
 ## 💻 Testar no computador
 
-Os dados são carregados de `data/*.json`, então abra com um servidor local (não direto pelo arquivo):
+Suba a API de teste e o site em dois terminais:
+
+```bash
+cd worker && npx wrangler dev --local --port 8787
+```
 
 ```bash
 python -m http.server 8000
 ```
 
-E acesse `http://localhost:8000`.
+E acesse `http://localhost:8000` (no computador, o site usa a API de teste automaticamente).

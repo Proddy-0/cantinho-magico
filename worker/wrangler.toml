@@ -1,0 +1,13 @@
+# API do Cantinho Mágico — roda em baiana.proddyt.com/api/*
+name = "cantinho-api"
+main = "src/index.js"
+compatibility_date = "2025-06-01"
+workers_dev = false
+
+routes = [
+  { pattern = "baiana.proddyt.com/api/*", zone_name = "proddyt.com" }
+]
+
+[[kv_namespaces]]
+binding = "KV"
+id = "f6ddf0b3116942ab9958ff197c517a8c"

@@ -316,9 +316,10 @@
     return false;
   }
 
+  // Posts e cronômetro vêm da API (Cloudflare Worker), editados pelo painel admin
   async function loadSiteSettings() {
     try {
-      const r = await fetch("data/site.json", { cache: "no-cache" });
+      const r = await fetch(`${SITE.api}/site`, { cache: "no-cache" });
       if (r.ok) LAUNCH = (await r.json()).launch || {};
     } catch (e) {
       LAUNCH = {};
@@ -328,12 +329,12 @@
 
   async function loadPosts() {
     try {
-      const r = await fetch("data/posts.json", { cache: "no-cache" });
+      const r = await fetch(`${SITE.api}/posts`, { cache: "no-cache" });
       if (!r.ok) throw new Error(r.status);
       const list = await r.json();
       return list.filter((p) => p && p.slug && CATS[p.category]).sort((a, b) => b.date.localeCompare(a.date));
     } catch (e) {
-      console.error("Não foi possível carregar data/posts.json", e);
+      console.error("Não foi possível carregar os posts", e);
       return [];
     }
   }

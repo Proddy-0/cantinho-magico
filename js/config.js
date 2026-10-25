@@ -23,8 +23,9 @@ Aqui você vai encontrar reviews, listas, guias pra quem está começando e muit
 > Fã-site pessoal, sem fins lucrativos e sem vínculo oficial com The Walt Disney Company, BIGHIT MUSIC/HYBE ou Formula 1.
 `,
 
-  // Repositório onde o painel admin salva os posts
-  github: { owner: "Proddy-0", repo: "cantinho-magico", branch: "main" },
+  // API (Cloudflare Worker) onde ficam posts, imagens, cronômetro e logins.
+  // No computador (localhost) usa a API de teste do "wrangler dev".
+  api: /^(localhost|127\.0\.0\.1)$/.test(location.hostname) ? "http://127.0.0.1:8787/api" : "api",
 
   /*
     🎨 CATEGORIAS

@@ -1,16 +1,13 @@
 /*
   ✏️ PAINEL ADMIN
-  Login com usuário (ou email) e senha, sem servidor:
-  - Cada pessoa tem um par de chaves RSA. A chave PRIVADA fica guardada criptografada com a
-    senha dela (PBKDF2 + AES-GCM). A chave do GitHub (token) fica trancada com a chave PÚBLICA.
-  - Senha certa → abre a chave privada → abre o token → publica no repositório.
-  - Trocar senha gera um par novo. Renovar o token não precisa da senha de ninguém
-    (é só trancar o token novo com as chaves públicas de todo mundo).
-  Arquivos: data/access.json (acessos), data/posts.json (posts), data/site.json (lançamento).
+  Login com usuário e senha na API do site (Cloudflare Worker em /api).
+  A senha nunca sai do navegador: mandamos só PBKDF2(senha, "cantinho-magico:<usuário>", 600 mil rodadas).
+  Posts, imagens, cronômetro e acessos ficam guardados na API.
 */
 (() => {
   const { md, esc, isImage, icon } = window.MD;
   const SITE = window.SITE;
+  const API = SITE.api || "api";
   const CATS = {
     disney: { label: "Disney", icon: "🏰", suggest: ["🏰", "✨", "🐭", "👑", "🎬", "🧜‍♀️", "🦁", "🎆"] },
     bts: { label: "BTS", icon: "💜", suggest: ["💜", "🎤", "🐰", "🐨", "🎶", "💿", "🎟️", "🌸"] },
@@ -18,37 +15,26 @@
   };
   Object.entries(SITE.categories || {}).forEach(([k, v]) => CATS[k] && Object.assign(CATS[k], v));
 
-  const POSTS_PATH = "data/posts.json";
-  const ACCESS_PATH = "data/access.json";
-  const SITE_PATH = "data/site.json";
-  const STICKERS_DIR = "img/stickers";
   const DRAFT_KEY = "admin-draft";
   const SESSION_KEY = "admin-session";
   const ITERATIONS = 600000;
   const MIN_PASSWORD = 8;
   const DEFAULT_TEMP = "123mudar";
-  const REPO = { branch: "main", ...(SITE.github || {}) };
-  const PAGE = document.body.dataset.page || "admin"; // "admin" (painel) ou "setup" (dono do site)
-  const DEFAULT_PEOPLE = [
-    { name: "Aysllan", login: "aysllan" },
-    { name: "Bia", login: "bia" },
-  ];
 
   const app = document.getElementById("admin-app");
   const toastEl = document.getElementById("toast");
   const subEl = document.getElementById("admin-sub");
   const logoutEl = document.getElementById("logout");
 
-  let session = null; // { owner, repo, branch, token, id, name }
-  let access = null; // conteúdo de data/access.json
+  let session = null; // { token, login, name }
   let siteCfg = { launch: {} };
   let posts = [];
   let stickers = [];
+  let people = [];
   let editing = null;
   let slugTouched = false;
   let cover = { value: "", fit: "" };
-  const pending = new Map(); // caminho → { b64, dataUrl } (imagens ainda não enviadas)
-  const uploaded = new Map(); // imagens já enviadas, mas que o GitHub Pages ainda não publicou
+  const pending = new Map(); // "local/…" → { blob, type, dataUrl, kind, name } (imagens ainda não enviadas)
 
   // ---------- armazenamento local ----------
   const store = {
@@ -73,22 +59,13 @@
   };
   const slugify = (s) =>
     String(s).normalize("NFD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "post";
-  const bytesToB64 = (bytes) => {
-    let bin = "";
-    new Uint8Array(bytes).forEach((b) => (bin += String.fromCharCode(b)));
-    return btoa(bin);
-  };
-  const b64ToBytes = (b64) => Uint8Array.from(atob(b64.replace(/\s/g, "")), (c) => c.charCodeAt(0));
-  const toB64 = (str) => bytesToB64(new TextEncoder().encode(str));
-  const fromB64 = (b64) => new TextDecoder().decode(b64ToBytes(b64));
-  const resolveImg = (p) => (pending.has(p) ? pending.get(p).dataUrl : uploaded.get(p) || p);
-  const imgTag = (src, fit) => `<img src="${esc(resolveImg(src))}" alt="" class="${fit === "contain" ? "sticker" : ""}">`;
+  const normLogin = (e) => String(e || "").trim().toLowerCase();
+  const validLogin = (e) => /^[a-z0-9._+-]{2,40}$/.test(e);
+  // Imagens guardadas na API têm caminho relativo "api/img/…"; no computador apontam pra API de teste
+  const imgUrl = (p) => (pending.has(p) ? pending.get(p).dataUrl : p.startsWith("api/") && API !== "api" ? API + p.slice(3) : p);
+  const imgTag = (src, fit) => `<img src="${esc(imgUrl(src))}" alt="" class="${fit === "contain" ? "sticker" : ""}">`;
   const coverHTML = (value, fit) => (isImage(value) ? imgTag(value, fit) : `<span>${esc(value || "✨")}</span>`);
   const fmtDay = (iso) => new Date(iso + "T12:00:00").toLocaleDateString("pt-BR", { day: "numeric", month: "short", year: "numeric" });
-  const normLogin = (e) => String(e || "").trim().toLowerCase();
-  const validLogin = (e) => /^[a-z0-9._+-]{2,}(@[a-z0-9.-]+\.[a-z]{2,})?$/.test(e);
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const now = () => new Date().toISOString();
 
   // Data/hora de Brasília (UTC-3, sem horário de verão) <-> campo datetime-local
   const isoToBrt = (iso) => {
@@ -108,132 +85,44 @@
     toastTimer = setTimeout(() => (toastEl.hidden = true), ms);
   }
 
-  // ---------- criptografia ----------
-  const enc = new TextEncoder();
-  const RSA = { name: "RSA-OAEP", hash: "SHA-256" };
-
-  async function loginId(login) {
-    const hash = await crypto.subtle.digest("SHA-256", enc.encode("cantinho-admin:" + normLogin(login)));
-    return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  // ---------- senha → chave (calculada no navegador) ----------
+  async function passwordKey(login, password) {
+    const enc = new TextEncoder();
+    const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", salt: enc.encode("cantinho-magico:" + normLogin(login)), iterations: ITERATIONS, hash: "SHA-256" },
+      base,
+      256
+    );
+    return [...new Uint8Array(bits)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  async function passwordKey(password, salt, iterations) {
-    const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
-    return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
-  }
-
-  async function sealToken(pub, token) {
-    const key = await crypto.subtle.importKey("spki", b64ToBytes(pub), RSA, false, ["encrypt"]);
-    return bytesToB64(await crypto.subtle.encrypt(RSA, key, enc.encode(token)));
-  }
-
-  // Cria as chaves de uma pessoa protegidas pela senha e tranca o token com elas
-  async function makeKeys(password, token) {
-    const pair = await crypto.subtle.generateKey({ ...RSA, modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) }, true, ["encrypt", "decrypt"]);
-    const pub = bytesToB64(await crypto.subtle.exportKey("spki", pair.publicKey));
-    const pkcs8 = await crypto.subtle.exportKey("pkcs8", pair.privateKey);
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await passwordKey(password, salt, ITERATIONS);
-    const data = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, pkcs8);
-    return {
-      pub,
-      priv: { iter: ITERATIONS, salt: bytesToB64(salt), iv: bytesToB64(iv), data: bytesToB64(data) },
-      token: await sealToken(pub, token),
-    };
-  }
-
-  async function makeUser({ name, login, password, temp }, token) {
-    return { id: await loginId(login), name, ...(await makeKeys(password, token)), mustChange: !!temp, updated: now() };
-  }
-
-  async function unlockToken(entry, password) {
-    const key = await passwordKey(password, b64ToBytes(entry.priv.salt), entry.priv.iter || ITERATIONS);
-    const pkcs8 = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(entry.priv.iv) }, key, b64ToBytes(entry.priv.data));
-    const priv = await crypto.subtle.importKey("pkcs8", pkcs8, RSA, false, ["decrypt"]);
-    return new TextDecoder().decode(await crypto.subtle.decrypt(RSA, priv, b64ToBytes(entry.token)));
-  }
-
-  // ---------- API do GitHub ----------
-  async function api(path, opts = {}, who = session) {
-    const r = await fetch(`https://api.github.com/repos/${who.owner}/${who.repo}${path}`, {
-      ...opts,
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${who.token}`,
-        "X-GitHub-Api-Version": "2022-11-28",
-        ...(opts.body ? { "Content-Type": "application/json" } : {}),
-        ...(opts.headers || {}),
-      },
-      cache: "no-store",
-    });
+  // ---------- API ----------
+  async function call(path, { method = "GET", body, blob } = {}) {
+    const headers = {};
+    if (session && session.token) headers.Authorization = `Bearer ${session.token}`;
+    let payload;
+    if (blob) {
+      payload = blob;
+      headers["Content-Type"] = blob.type;
+    } else if (body !== undefined) {
+      payload = JSON.stringify(body);
+      headers["Content-Type"] = "application/json";
+    }
+    let r;
+    try {
+      r = await fetch(`${API}${path}`, { method, headers, body: payload, cache: "no-store" });
+    } catch (e) {
+      throw new Error("📡 Sem conexão. Confira a internet e tente de novo.");
+    }
+    const data = await r.json().catch(() => ({}));
     if (!r.ok) {
-      const body = await r.json().catch(() => ({}));
-      const err = new Error(body.message || `Erro ${r.status}`);
+      const err = new Error(data.error || `Erro ${r.status}`);
       err.status = r.status;
-      if (r.status === 401 && who === session) expireSession();
+      if (r.status === 401 && session && path !== "/login") expireSession();
       throw err;
     }
-    return (opts.headers || {}).Accept === "application/vnd.github.raw" ? r.text() : r.json();
-  }
-
-  const contentsUrl = (path) => `/contents/${path.split("/").map(encodeURIComponent).join("/")}`;
-  const refQ = (who = session) => `?ref=${encodeURIComponent(who.branch)}`;
-
-  async function getFile(path, who = session) {
-    try {
-      return await api(contentsUrl(path) + refQ(who), {}, who);
-    } catch (e) {
-      if (e.status === 404) return null;
-      throw e;
-    }
-  }
-
-  const putFile = (path, b64, message, sha, who = session) =>
-    api(contentsUrl(path), { method: "PUT", body: JSON.stringify({ message, content: b64, branch: who.branch, ...(sha ? { sha } : {}) }) }, who);
-
-  async function getJSON(path, fallback, who = session) {
-    const file = await getFile(path, who);
-    if (!file) return { value: fallback, sha: null };
-    let text = file.content ? fromB64(file.content) : "";
-    if (!text && file.size) text = await api(contentsUrl(path) + refQ(who), { headers: { Accept: "application/vnd.github.raw" } }, who);
-    return { value: text.trim() ? JSON.parse(text) : fallback, sha: file.sha };
-  }
-
-  const putJSON = (path, value, message, sha, who = session) => putFile(path, toB64(JSON.stringify(value, null, 2) + "\n"), message, sha, who);
-
-  // Lê a versão mais nova do access.json, aplica a mudança e salva
-  async function updateAccess(change, message, who = session) {
-    const { value, sha } = await getJSON(ACCESS_PATH, null, who);
-    const next = value && Array.isArray(value.users) ? value : { version: 2, owner: who.owner, repo: who.repo, branch: who.branch, users: [] };
-    await change(next);
-    next.updated = now();
-    await putJSON(ACCESS_PATH, next, message, sha, who);
-    access = next;
-    return next;
-  }
-
-  async function fetchPosts() {
-    const { value, sha } = await getJSON(POSTS_PATH, []);
-    return { list: Array.isArray(value) ? value : [], sha };
-  }
-
-  async function listStickers() {
-    try {
-      const files = await api(contentsUrl(STICKERS_DIR) + refQ());
-      return Array.isArray(files) ? files.filter((f) => f.type === "file" && isImage(f.name)).map((f) => f.path) : [];
-    } catch (e) {
-      return [];
-    }
-  }
-
-  function errMsg(e) {
-    if (e.status === 401) return "🔑 A chave do GitHub expirou ou foi apagada. Quem é dono(a) do site precisa renovar a chave.";
-    if (e.status === 403) return "🚫 A chave do GitHub não tem permissão de escrita (Contents: Read and write).";
-    if (e.status === 404) return "🔍 Repositório não encontrado, ou a chave não tem acesso a ele.";
-    if (e.status === 409 || e.status === 422) return "⚠️ O arquivo mudou enquanto você editava. Tente de novo.";
-    if (e instanceof TypeError) return "📡 Sem conexão com o GitHub. Confira a internet e tente de novo.";
-    return `⚠️ ${esc(e.message)}`;
+    return data;
   }
 
   // ---------- sessão ----------
@@ -249,24 +138,14 @@
     setTimeout(() => viewLogin("Sua sessão expirou. Entre de novo."), 50);
   }
 
-  logoutEl.addEventListener("click", (e) => {
+  logoutEl.addEventListener("click", async (e) => {
     e.preventDefault();
+    try { await call("/logout", { method: "POST" }); } catch (x) {}
     store.del(SESSION_KEY);
     session = null;
     pending.clear();
     viewLogin();
   });
-
-  async function loadAccess() {
-    try {
-      const r = await fetch(ACCESS_PATH, { cache: "no-cache" });
-      if (!r.ok) return null;
-      const a = await r.json();
-      return a && a.version === 2 && Array.isArray(a.users) && a.users.length ? a : null;
-    } catch (e) {
-      return null;
-    }
-  }
 
   function setHeader(loggedIn) {
     logoutEl.hidden = !loggedIn;
@@ -288,17 +167,8 @@
   }
 
   // ---------- login ----------
-  function viewLogin(message, ok) {
+  function viewLogin(message) {
     setHeader(false);
-    if (!access) {
-      app.innerHTML = `
-        <section class="panel login">
-          <p class="eyebrow">🔐 Painel</p>
-          <h1>Painel ainda não configurado</h1>
-          <p class="muted">Quem é dono(a) do site precisa fazer a configuração inicial antes do primeiro login.</p>
-        </section>`;
-      return;
-    }
     app.innerHTML = `
       <section class="panel login">
         <p class="eyebrow">🔐 Entrar</p>
@@ -308,9 +178,9 @@
           <label>Senha<input name="password" type="password" required autocomplete="current-password"></label>
           <label class="check"><input type="checkbox" name="remember"> Continuar conectado(a) neste aparelho</label>
           <button class="btn primary" type="submit">Entrar</button>
-          <p class="${ok ? "form-ok" : "form-error"}" id="login-msg" ${message ? "" : "hidden"}>${esc(message || "")}</p>
+          <p class="form-error" id="login-msg" ${message ? "" : "hidden"}>${esc(message || "")}</p>
         </form>
-        <p class="muted small">Primeiro acesso? Use a senha provisória que você recebeu. Logo depois o painel pede pra você criar a sua.</p>
+        <p class="muted small">Primeiro acesso? Entre com a senha provisória. Logo em seguida o painel pede pra você criar a sua.</p>
       </section>`;
 
     const form = app.querySelector("#login-form");
@@ -320,27 +190,17 @@
       const btn = form.querySelector("button[type=submit]");
       const msgEl = app.querySelector("#login-msg");
       msgEl.hidden = true;
-      msgEl.className = "form-error";
       btn.disabled = true;
       btn.textContent = "Entrando…";
-      const login = normLogin(form.login.value);
-      const password = form.password.value;
       try {
-        const id = await loginId(login);
-        const entry = access.users.find((u) => u.id === id);
-        let token = null;
-        if (entry) {
-          try { token = await unlockToken(entry, password); } catch (x) { token = null; }
-        } else await sleep(700);
-        if (!token) throw Object.assign(new Error("Usuário ou senha incorretos."), { login: true });
-
-        const next = { owner: access.owner, repo: access.repo, branch: access.branch || "main", token, id, name: entry.name };
-        await api("", {}, next);
-        if (entry.mustChange) return viewNewPassword(next, form.remember.checked);
-        startSession(next, form.remember.checked);
+        const login = normLogin(form.login.value);
+        const key = await passwordKey(login, form.password.value);
+        const { token, user } = await call("/login", { method: "POST", body: { login, key } });
+        startSession({ token, login: user.login, name: user.name }, form.remember.checked);
+        if (user.mustChange) return viewNewPassword();
         await openDashboard();
       } catch (err) {
-        msgEl.textContent = err.login ? err.message : errMsg(err).replace(/<[^>]+>/g, "");
+        msgEl.textContent = err.message;
         msgEl.hidden = false;
         btn.disabled = false;
         btn.textContent = "Entrar";
@@ -350,13 +210,13 @@
   }
 
   // Primeiro acesso: troca a senha provisória pela definitiva
-  function viewNewPassword(who, remember) {
-    setHeader(false);
+  function viewNewPassword() {
+    setHeader(true);
     app.innerHTML = `
       <section class="panel login">
         <p class="eyebrow">🔑 Primeiro acesso</p>
-        <h1>Oi, ${esc(who.name)}! Crie sua senha</h1>
-        <p class="muted">Você entrou com a senha provisória. Escolha agora a sua senha (mínimo ${MIN_PASSWORD} caracteres). Ela fica registrada e passa a valer no próximo login.</p>
+        <h1>Oi, ${esc(session.name)}! Crie sua senha</h1>
+        <p class="muted">Você entrou com a senha provisória. Escolha agora a sua senha (mínimo ${MIN_PASSWORD} caracteres). Ela fica registrada e é a que vale daqui pra frente.</p>
         <form id="newpass-form" class="form">
           ${passwordFields()}
           <button class="btn primary" type="submit">Salvar minha senha</button>
@@ -370,198 +230,18 @@
       const errEl = app.querySelector("#newpass-error");
       const btn = form.querySelector("button");
       errEl.hidden = true;
-      let password;
-      try {
-        password = checkNewPassword(form);
-      } catch (err) {
-        errEl.textContent = err.message;
-        errEl.hidden = false;
-        return;
-      }
       btn.disabled = true;
       btn.textContent = "Registrando…";
       try {
-        const keys = await makeKeys(password, who.token);
-        await updateAccess((a) => {
-          const u = a.users.find((x) => x.id === who.id);
-          if (!u) throw new Error("Seu acesso não existe mais. Fale com quem administra o site.");
-          Object.assign(u, keys, { mustChange: false, updated: now() });
-        }, `${who.name} definiu a própria senha`, who);
-        startSession(who, remember);
+        const password = checkNewPassword(form);
+        await call("/password", { method: "POST", body: { key: await passwordKey(session.login, password) } });
         await openDashboard();
         toast("✅ Senha registrada! Da próxima vez, entre com a senha nova.", "ok", 8000);
       } catch (err) {
-        errEl.innerHTML = err.status ? errMsg(err) : esc(err.message);
+        errEl.textContent = err.message;
         errEl.hidden = false;
         btn.disabled = false;
         btn.textContent = "Salvar minha senha";
-      }
-    });
-  }
-
-  // ---------- configuração inicial (dono do repositório) ----------
-  const personHTML = (p = {}, i = 0) => `
-    <fieldset class="person">
-      <legend>Pessoa ${i + 1}</legend>
-      <div class="row">
-        <label>Nome<input name="name" required value="${esc(p.name || "")}"></label>
-        <label>Usuário<input name="login" required autocapitalize="none" spellcheck="false" value="${esc(p.login || "")}" placeholder="ex: bia"></label>
-      </div>
-      <label>Senha provisória<input name="password" required value="${esc(DEFAULT_TEMP)}" autocomplete="off"></label>
-    </fieldset>`;
-
-  function readPeople(root) {
-    const people = [...root.querySelectorAll(".person")].map((fs) => ({
-      name: fs.querySelector("[name=name]").value.trim(),
-      login: normLogin(fs.querySelector("[name=login]").value),
-      password: fs.querySelector("[name=password]").value,
-      temp: true,
-    }));
-    const seen = new Set();
-    for (const p of people) {
-      if (!p.name) throw new Error("Preencha o nome de todo mundo.");
-      if (!validLogin(p.login)) throw new Error(`Usuário inválido: “${p.login || "(vazio)"}”. Use letras minúsculas, números, ponto ou um email.`);
-      if (seen.has(p.login)) throw new Error(`O usuário ${p.login} aparece duas vezes.`);
-      seen.add(p.login);
-      if (p.password.length < 6) throw new Error(`A senha provisória de ${p.name} precisa ter pelo menos 6 caracteres.`);
-    }
-    return people;
-  }
-
-  // ---------- página do dono do site (setup.html, sem link no site) ----------
-  const tokenHelp = () => `
-    <details class="help">
-      <summary>Como criar a chave</summary>
-      <ol>
-        <li>Abra <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained token</a>.</li>
-        <li>Nome: <em>painel do blog</em>. Escolha a validade (quando vencer, é só renovar nesta página).</li>
-        <li><strong>Repository access</strong> → <em>Only select repositories</em> → <strong>${esc(REPO.repo || "")}</strong>.</li>
-        <li><strong>Permissions → Repository permissions → Contents</strong> → <em>Read and write</em>.</li>
-        <li><strong>Generate token</strong>, copie e cole aqui.</li>
-      </ol>
-    </details>`;
-
-  async function checkToken(token) {
-    if (token.length > 180) throw new Error("Esse token é grande demais. Use um Fine-grained token do GitHub.");
-    const who = { ...REPO, token };
-    const repo = await api("", {}, who);
-    if (repo.permissions && !repo.permissions.push) throw Object.assign(new Error(), { status: 403 });
-    return who;
-  }
-
-  function viewOwner(message) {
-    setHeader(false);
-    subEl.textContent = "Área do dono do site";
-    const users = (access && access.users) || [];
-    const waiting = users.filter((u) => u.mustChange).map((u) => u.name);
-    const advice = !access
-      ? ""
-      : waiting.length
-        ? `<p class="banner">⏳ Aguardando ${esc(waiting.join(" e "))} entrar e criar a própria senha. Depois disso, renove a chave aqui.</p>`
-        : access.tokenExposed
-          ? `<p class="banner warn">🔒 Todo mundo já criou a própria senha. Renove a chave do GitHub agora: assim a senha provisória que ficou no histórico não serve pra mais nada.</p>`
-          : `<p class="form-ok">✅ Tudo certo. Renove a chave só quando ela vencer.</p>`;
-
-    app.innerHTML = `
-      ${message ? `<p class="form-ok owner-msg">${message}</p>` : ""}
-      ${
-        access
-          ? `<section class="panel login setup">
-              <p class="eyebrow">🔑 Chave do GitHub</p>
-              <h1>Renovar chave</h1>
-              <p class="muted">Use quando a chave vencer, ou por segurança. Ninguém precisa trocar de senha.</p>
-              ${advice}
-              <ul class="people-list">${users
-                .map((u) => `<li><span>👤 <strong>${esc(u.name)}</strong></span>${u.mustChange ? '<span class="badge warn">senha provisória</span>' : '<span class="badge on">senha própria</span>'}</li>`)
-                .join("")}</ul>
-              <form id="renew-form" class="form">
-                <label>Nova chave (token)<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
-                ${tokenHelp()}
-                <button class="btn primary" type="submit">Renovar chave</button>
-                <p class="form-error" id="renew-error" hidden></p>
-              </form>
-            </section>`
-          : ""
-      }
-
-      <section class="panel login setup">
-        <p class="eyebrow">⚙️ Configuração</p>
-        <h1>${access ? "Configurar do zero" : "Configuração inicial"}</h1>
-        <p class="muted">Cria os usuários do painel com <strong>senha provisória</strong>. No primeiro login cada pessoa cria a própria senha.</p>
-        ${access ? '<p class="form-error">⚠️ Isso apaga todos os acessos atuais e cria de novo.</p>' : ""}
-        <form id="setup-form" class="form">
-          <div id="people">${DEFAULT_PEOPLE.map(personHTML).join("")}</div>
-          <button type="button" class="btn ghost" id="add-person">＋ Adicionar outra pessoa</button>
-          <label>Chave do GitHub (token)<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
-          ${tokenHelp()}
-          <button class="btn ${access ? "danger" : "primary"}" type="submit">${access ? "Apagar e configurar de novo" : "Salvar acessos"}</button>
-          <p class="form-error" id="setup-error" hidden></p>
-        </form>
-      </section>`;
-
-    const people = app.querySelector("#people");
-    app.querySelector("#add-person").addEventListener("click", () => {
-      people.insertAdjacentHTML("beforeend", personHTML({}, people.children.length));
-    });
-
-    const showErr = (id, err) => {
-      const el = app.querySelector(id);
-      el.innerHTML = err.status || err instanceof TypeError ? errMsg(err) : esc(err.message);
-      el.hidden = false;
-    };
-
-    // Renovar: tranca a chave nova com a chave pública de cada pessoa
-    app.querySelector("#renew-form")?.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const f = e.target;
-      const btn = f.querySelector("button[type=submit]");
-      app.querySelector("#renew-error").hidden = true;
-      btn.disabled = true;
-      btn.textContent = "Testando a chave…";
-      try {
-        const who = await checkToken(f.token.value.trim());
-        btn.textContent = "Salvando…";
-        await updateAccess(async (a) => {
-          for (const u of a.users) u.token = await sealToken(u.pub, who.token);
-          a.tokenExposed = a.users.some((u) => u.mustChange);
-        }, "Renova a chave do GitHub do painel", who);
-        store.del(SESSION_KEY);
-        viewOwner("✅ Chave renovada! Agora apague a chave antiga no GitHub (Settings → Developer settings → Fine-grained tokens).");
-      } catch (err) {
-        showErr("#renew-error", err);
-        btn.disabled = false;
-        btn.textContent = "Renovar chave";
-      }
-    });
-
-    app.querySelector("#setup-form").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const f = e.target;
-      const btn = f.querySelector("button[type=submit]");
-      const label = btn.textContent;
-      app.querySelector("#setup-error").hidden = true;
-      if (access && !confirm("Apagar todos os acessos e configurar de novo?")) return;
-      btn.disabled = true;
-      try {
-        const list = readPeople(people);
-        btn.textContent = "Testando a chave…";
-        const who = await checkToken(f.token.value.trim());
-        const users = [];
-        for (const p of list) {
-          btn.textContent = `Criando acesso de ${p.name}…`;
-          users.push(await makeUser(p, who.token));
-        }
-        btn.textContent = "Salvando…";
-        const current = await getFile(ACCESS_PATH, who);
-        const next = { version: 2, owner: who.owner, repo: who.repo, branch: who.branch, users, tokenExposed: true, updated: now() };
-        await putJSON(ACCESS_PATH, next, "Configura acesso ao painel admin", current && current.sha, who);
-        access = next;
-        store.del(SESSION_KEY);
-        viewOwner(`✅ Acessos criados! Em ~1 minuto já dá pra entrar em <a href="admin.html">admin.html</a> com o usuário e a senha provisória.`);
-      } catch (err) {
-        showErr("#setup-error", err);
-        btn.disabled = false;
-        btn.textContent = label;
       }
     });
   }
@@ -571,19 +251,15 @@
     setHeader(true);
     app.innerHTML = `<p class="loading">Carregando…</p>`;
     try {
-      const [p, s, cfg, acc] = await Promise.all([
-        fetchPosts().then((r) => r.list),
-        listStickers(),
-        getJSON(SITE_PATH, { launch: {} }).then((r) => r.value),
-        getJSON(ACCESS_PATH, null).then((r) => r.value),
-      ]);
-      posts = p;
-      stickers = s;
+      const [me, p, s, cfg, u] = await Promise.all([call("/me"), call("/posts"), call("/stickers"), call("/site"), call("/users")]);
+      if (me.user.mustChange) return viewNewPassword();
+      posts = Array.isArray(p) ? p : [];
+      stickers = Array.isArray(s) ? s : [];
       siteCfg = cfg || { launch: {} };
-      if (acc) access = acc;
+      people = Array.isArray(u) ? u : [];
     } catch (err) {
-      if (session) app.innerHTML = `<p class="loading">${errMsg(err)}</p>`;
-      toast(errMsg(err), "error");
+      if (err.status === 403) return viewNewPassword();
+      if (session) app.innerHTML = `<p class="loading">${esc(err.message)}</p>`;
       return;
     }
     renderDashboard();
@@ -623,7 +299,7 @@
               <div class="cover-actions">
                 <button type="button" class="btn ghost" id="sticker-upload">✨ Enviar figurinha PNG</button>
                 <button type="button" class="btn ghost" id="photo-upload">📷 Usar foto</button>
-                <input type="file" accept="image/png,image/webp,image/gif,image/svg+xml" id="sticker-file" hidden>
+                <input type="file" accept="image/png,image/webp,image/gif" id="sticker-file" hidden>
                 <input type="file" accept="image/*" id="photo-file" hidden>
               </div>
               <div class="emoji-suggest" id="emoji-suggest"></div>
@@ -789,17 +465,17 @@
     app.querySelector("#person-form").addEventListener("submit", addPerson);
     app.querySelector("#mypass-form").addEventListener("submit", changeMyPassword);
     app.querySelector("#people-list").addEventListener("click", (e) => {
-      const b = e.target.closest("button[data-id]");
+      const b = e.target.closest("button[data-login]");
       if (!b) return;
-      if (b.dataset.act === "reset") resetPerson(b.dataset.id);
-      if (b.dataset.act === "remove") removePerson(b.dataset.id);
+      if (b.dataset.act === "reset") resetPerson(b.dataset.login);
+      if (b.dataset.act === "remove") removePerson(b.dataset.login);
     });
 
     renderList();
     renderPeople();
     fillLaunch();
     const draft = store.get(DRAFT_KEY);
-    if (draft) {
+    if (draft && draft.post) {
       fillForm(draft.post, draft.editing);
       app.querySelector("#draft-note").textContent = "Rascunho recuperado ✓";
     } else resetForm();
@@ -831,17 +507,16 @@
   }
 
   function renderPeople() {
-    const users = (access && access.users) || [];
     app.querySelector("#people-list").innerHTML =
-      users
+      people
         .map(
           (u) => `
         <li>
-          <span>👤 <strong>${esc(u.name || "Sem nome")}</strong>${u.id === session.id ? ' <small class="muted">(você)</small>' : ""}
+          <span>👤 <strong>${esc(u.name)}</strong> <small class="muted">@${esc(u.login)}</small>${u.login === session.login ? ' <small class="muted">(você)</small>' : ""}
             ${u.mustChange ? '<span class="badge warn">senha provisória</span>' : ""}</span>
           <span class="pl-actions">
-            ${u.id !== session.id ? `<button class="btn ghost" data-act="reset" data-id="${esc(u.id)}">Resetar senha</button>` : ""}
-            ${users.length > 1 ? `<button class="btn danger" data-act="remove" data-id="${esc(u.id)}">Remover</button>` : ""}
+            ${u.login !== session.login ? `<button class="btn ghost" data-act="reset" data-login="${esc(u.login)}">Resetar senha</button>` : ""}
+            ${people.length > 1 ? `<button class="btn danger" data-act="remove" data-login="${esc(u.login)}">Remover</button>` : ""}
           </span>
         </li>`
         )
@@ -890,14 +565,11 @@
     btn.disabled = true;
     btn.textContent = "Salvando…";
     try {
-      const { value, sha } = await getJSON(SITE_PATH, {});
-      const next = { ...(value || {}), launch };
-      await putJSON(SITE_PATH, next, `${launch.enabled ? "Liga" : "Desliga"} cronômetro de lançamento`, sha);
-      siteCfg = next;
+      siteCfg = await call("/site", { method: "PUT", body: { launch } });
       renderLaunchInfo();
-      toast(launch.enabled ? `🚀 Cronômetro ligado até ${esc(fmtBrt(launch.date))}. Vale no site em ~1 minuto.` : "✅ Cronômetro desligado. O site fica aberto (em ~1 minuto).", "ok", 8000);
+      toast(launch.enabled ? `🚀 Cronômetro ligado até ${esc(fmtBrt(launch.date))}.` : "✅ Cronômetro desligado. O site fica aberto.", "ok", 8000);
     } catch (err) {
-      toast(errMsg(err), "error", 9000);
+      toast(esc(err.message), "error", 9000);
     } finally {
       btn.disabled = false;
       btn.textContent = "💾 Salvar cronômetro";
@@ -909,68 +581,54 @@
     e.preventDefault();
     const f = e.target;
     const btn = f.querySelector("button[type=submit]");
-    let person;
-    try {
-      [person] = readPeople({ querySelectorAll: () => [f] });
-    } catch (err) {
-      return toast(esc(err.message), "error");
-    }
+    const name = f.name.value.trim();
+    const login = normLogin(f.login.value);
+    const temp = f.password.value;
+    if (!validLogin(login)) return toast("Usuário inválido. Use letras minúsculas, números ou ponto.", "error");
+    if (temp.length < 6) return toast("A senha provisória precisa ter pelo menos 6 caracteres.", "error");
     btn.disabled = true;
     btn.textContent = "Criando…";
     try {
-      const entry = await makeUser(person, session.token);
-      await updateAccess((a) => {
-        if (a.users.some((u) => u.id === entry.id)) throw new Error(`O usuário ${person.login} já existe. Use “Resetar senha”.`);
-        a.users.push(entry);
-        a.tokenExposed = true;
-      }, `Dá acesso a ${person.name}`);
+      people = await call("/users", { method: "POST", body: { name, login, key: await passwordKey(login, temp) } });
       renderPeople();
       f.reset();
       f.closest("details").open = false;
-      toast(`✅ Acesso criado para ${esc(person.name)} (usuário <strong>${esc(person.login)}</strong>, senha provisória). Vale em ~1 minuto.`, "ok", 9000);
+      toast(`✅ Acesso criado: usuário <strong>${esc(login)}</strong> com a senha provisória.`, "ok", 9000);
     } catch (err) {
-      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+      toast(esc(err.message), "error", 9000);
     } finally {
       btn.disabled = false;
       btn.textContent = "Criar acesso";
     }
   }
 
-  async function resetPerson(id) {
-    const user = access.users.find((u) => u.id === id);
+  async function resetPerson(login) {
+    const user = people.find((u) => u.login === login);
     if (!user) return;
     const temp = prompt(`Senha provisória pra ${user.name}:\n(no próximo login, ${user.name} cria uma senha nova)`, DEFAULT_TEMP);
     if (temp === null) return;
     if (temp.length < 6) return toast("A senha provisória precisa ter pelo menos 6 caracteres.", "error");
     try {
-      const keys = await makeKeys(temp, session.token);
-      await updateAccess((a) => {
-        const u = a.users.find((x) => x.id === id);
-        if (!u) throw new Error("Esse acesso não existe mais.");
-        Object.assign(u, keys, { mustChange: true, updated: now() });
-        a.tokenExposed = true;
-      }, `Reseta a senha de ${user.name}`);
+      people = await call(`/users/${encodeURIComponent(login)}/reset`, { method: "POST", body: { key: await passwordKey(login, temp) } });
       renderPeople();
       toast(`🔄 Senha de ${esc(user.name)} resetada para a provisória.`);
     } catch (err) {
-      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+      toast(esc(err.message), "error", 9000);
     }
   }
 
-  async function removePerson(id) {
-    const user = (access.users || []).find((u) => u.id === id);
+  async function removePerson(login) {
+    const user = people.find((u) => u.login === login);
     if (!user) return;
-    const self = id === session.id;
+    const self = login === session.login;
     if (!confirm(`Remover o acesso de ${user.name}?${self ? "\n\nVocê não vai mais conseguir entrar com esse usuário." : ""}`)) return;
     try {
-      await updateAccess((a) => {
-        if (a.users.length <= 1) throw new Error("Precisa ficar pelo menos uma pessoa com acesso.");
-        a.users = a.users.filter((u) => u.id !== id);
-      }, `Remove acesso de ${user.name}`);
+      people = await call(`/users/${encodeURIComponent(login)}`, { method: "DELETE" });
+      if (self) return expireSession();
       renderPeople();
-      toast(`🗑️ Acesso de ${esc(user.name)} removido. Por segurança, renove a chave do GitHub.`, "ok", 9000);
+      toast(`🗑️ Acesso de ${esc(user.name)} removido.`);
     } catch (err) {
-      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+      toast(esc(err.message), "error", 9000);
     }
   }
 
@@ -978,27 +636,16 @@
     e.preventDefault();
     const f = e.target;
     const btn = f.querySelector("button[type=submit]");
-    let password;
-    try {
-      password = checkNewPassword(f);
-    } catch (err) {
-      return toast(esc(err.message), "error");
-    }
     btn.disabled = true;
     btn.textContent = "Salvando…";
     try {
-      const keys = await makeKeys(password, session.token);
-      await updateAccess((a) => {
-        const u = a.users.find((x) => x.id === session.id);
-        if (!u) throw new Error("Seu acesso não existe mais.");
-        Object.assign(u, keys, { mustChange: false, updated: now() });
-      }, `${session.name} trocou a senha`);
-      renderPeople();
+      const password = checkNewPassword(f);
+      await call("/password", { method: "POST", body: { key: await passwordKey(session.login, password) } });
       f.reset();
       f.closest("details").open = false;
       toast("✅ Senha trocada!");
     } catch (err) {
-      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+      toast(esc(err.message), "error", 9000);
     } finally {
       btn.disabled = false;
       btn.textContent = "Salvar nova senha";
@@ -1046,7 +693,8 @@
     app.querySelector("#ed-heading").textContent = editing ? "Editando post" : "Novo post";
     app.querySelector("#publish").textContent = editing ? "💾 Salvar alterações" : "🚀 Publicar";
     renderSuggestions();
-    setCover(post.cover || "", post.coverFit || "");
+    // imagens locais de um rascunho antigo já não existem
+    setCover(pending.has(post.cover) || !String(post.cover || "").startsWith("local/") ? post.cover || "" : "", post.coverFit || "");
   }
 
   function resetForm() {
@@ -1078,10 +726,11 @@
     const cat = form().elements.category.value;
     const emojis = cat ? CATS[cat].suggest : Object.values(CATS).flatMap((c) => c.suggest.slice(0, 3));
     const catIcons = Object.values(CATS).map((c) => c.icon).filter(isImage);
-    const imgs = [...new Set([...catIcons, ...stickers, ...[...pending.keys()].filter((p) => p.startsWith(STICKERS_DIR + "/"))])];
+    const localStickers = [...pending.entries()].filter(([, v]) => v.kind === "sticker").map(([k]) => k);
+    const imgs = [...new Set([...catIcons, ...stickers, ...localStickers])];
     app.querySelector("#emoji-suggest").innerHTML =
       emojis.map((e) => `<button type="button" data-value="${esc(e)}" title="Usar ${esc(e)}">${esc(e)}</button>`).join("") +
-      imgs.map((p) => `<button type="button" class="sticker-btn" data-value="${esc(p)}" data-fit="contain" title="Usar figurinha"><img src="${esc(resolveImg(p))}" alt=""></button>`).join("");
+      imgs.map((p) => `<button type="button" class="sticker-btn" data-value="${esc(p)}" data-fit="contain" title="Usar figurinha"><img src="${esc(imgUrl(p))}" alt=""></button>`).join("");
   }
 
   function renderPreview() {
@@ -1100,7 +749,7 @@
       </article>
       <article class="post preview-post" ${cat ? `data-cat="${p.category}"` : ""}>
         <h1>${esc(p.title || "Título do post")}</h1>
-        <div class="prose">${md(p.body, resolveImg) || '<p class="muted">O texto aparece aqui enquanto você escreve.</p>'}</div>
+        <div class="prose">${md(p.body, imgUrl) || '<p class="muted">O texto aparece aqui enquanto você escreve.</p>'}</div>
       </article>`;
   }
 
@@ -1139,13 +788,14 @@
   }
 
   // ---------- imagens ----------
-  const readDataUrl = (file) =>
+  const toDataUrl = (blob) =>
     new Promise((res, rej) => {
       const r = new FileReader();
       r.onload = () => res(r.result);
       r.onerror = rej;
-      r.readAsDataURL(file);
+      r.readAsDataURL(blob);
     });
+  const canvasBlob = (canvas, type, q) => new Promise((res) => canvas.toBlob(res, type, q));
 
   function hasAlpha(ctx, w, h) {
     const d = ctx.getImageData(0, 0, w, h).data;
@@ -1153,18 +803,16 @@
     return false;
   }
 
-  // kind "sticker": PNG com fundo transparente (máx. 512px) em img/stickers/
-  // kind "photo": foto (máx. 1600px) em img/, JPG ou PNG se tiver transparência
+  // kind "sticker": PNG com fundo transparente (máx. 512px)
+  // kind "photo": foto (máx. 1600px), JPG, ou PNG se tiver transparência
+  // A imagem fica guardada aqui até publicar (caminho provisório "local/…")
   async function addImage(file, kind) {
-    if (!file.type.startsWith("image/")) return toast("Escolha um arquivo de imagem.", "error");
+    if (!file.type.startsWith("image/") || file.type === "image/svg+xml") return toast("Escolha uma imagem PNG, JPG, GIF ou WEBP.", "error");
     try {
-      const dir = kind === "sticker" ? STICKERS_DIR : "img";
-      const base = `${dir}/${Date.now().toString(36)}-${slugify(file.name.replace(/\.[^.]+$/, "")).slice(0, 40)}`;
-      let dataUrl, path;
-      if (file.type === "image/gif" || file.type === "image/svg+xml") {
-        if (file.size > 5e6) return toast("Esse arquivo é muito grande (máx. 5 MB).", "error");
-        dataUrl = await readDataUrl(file);
-        path = `${base}.${file.type === "image/gif" ? "gif" : "svg"}`;
+      let blob;
+      if (file.type === "image/gif") {
+        if (file.size > 5e6) return toast("Esse GIF é muito grande (máx. 5 MB).", "error");
+        blob = file;
       } else {
         const bmp = await createImageBitmap(file);
         const max = kind === "sticker" ? 512 : 1600;
@@ -1175,18 +823,19 @@
         const ctx = canvas.getContext("2d");
         ctx.drawImage(bmp, 0, 0, canvas.width, canvas.height);
         const keepPng = kind === "sticker" || (file.type !== "image/jpeg" && hasAlpha(ctx, canvas.width, canvas.height));
-        if (keepPng) {
-          dataUrl = canvas.toDataURL("image/png");
-          path = `${base}.png`;
-        } else {
+        if (keepPng) blob = await canvasBlob(canvas, "image/png");
+        else {
           ctx.globalCompositeOperation = "destination-over";
           ctx.fillStyle = "#fff";
           ctx.fillRect(0, 0, canvas.width, canvas.height);
-          dataUrl = canvas.toDataURL("image/jpeg", 0.85);
-          path = `${base}.jpg`;
+          blob = await canvasBlob(canvas, "image/jpeg", 0.85);
         }
       }
-      pending.set(path, { dataUrl, b64: dataUrl.split(",")[1] });
+      if (blob.size > 5e6) return toast("Imagem muito grande (máx. 5 MB).", "error");
+      const ext = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp" }[blob.type] || "png";
+      const name = slugify(file.name.replace(/\.[^.]+$/, "")).slice(0, 40);
+      const path = `local/${Date.now().toString(36)}-${name}.${ext}`;
+      pending.set(path, { blob, dataUrl: await toDataUrl(blob), kind, name });
       if (kind === "sticker") renderSuggestions();
       toast("Imagem pronta. Ela vai junto quando você publicar 📷", "ok", 3500);
       return path;
@@ -1213,34 +862,31 @@
     if (!post.title || !post.body || !CATS[post.category]) return toast("Preencha título, categoria e texto.", "error");
 
     try {
+      // 1) envia as imagens usadas e troca o caminho provisório pelo definitivo
       const used = [...pending.keys()].filter((p) => post.body.includes(p) || post.cover === p);
       for (let i = 0; i < used.length; i++) {
         setBusy(true, `Enviando imagem ${i + 1}/${used.length}…`);
-        await putFile(used[i], pending.get(used[i]).b64, `Imagem para "${post.title}"`);
-        if (used[i].startsWith(STICKERS_DIR + "/")) stickers.push(used[i]);
-        uploaded.set(used[i], pending.get(used[i]).dataUrl);
-        pending.delete(used[i]);
+        const img = pending.get(used[i]);
+        const { url } = await call(`/images?kind=${img.kind}&name=${encodeURIComponent(img.name)}`, { method: "POST", blob: img.blob });
+        post.body = post.body.split(used[i]).join(url);
+        if (post.cover === used[i]) post.cover = url;
+        if (img.kind === "sticker") stickers.push(url);
       }
 
+      // 2) salva o post
       setBusy(true, "Publicando…");
-      const { list, sha } = await fetchPosts();
-      const idx = editing ? list.findIndex((p) => p.slug === editing) : -1;
-      const baseSlug = post.slug;
-      for (let n = 2; list.some((p, i) => p.slug === post.slug && i !== idx); n++) post.slug = `${baseSlug}-${n}`;
-      if (idx >= 0) list[idx] = post;
-      else list.unshift(post);
-
-      await putJSON(POSTS_PATH, list, `${idx >= 0 ? "Edita" : "Novo"} post: ${post.title}`, sha);
-      posts = list;
+      const res = await call("/posts", { method: "POST", body: { post, original: editing } });
+      posts = res.posts;
+      used.forEach((p) => pending.delete(p));
       renderList();
       resetForm();
       toast(
-        `✨ ${idx >= 0 ? "Alterações salvas" : "Post publicado"}! Aparece no site em cerca de 1 minuto. <a href="./#/post/${esc(post.slug)}" target="_blank" rel="noopener">Abrir post ↗</a>`,
+        `✨ ${editing ? "Alterações salvas" : "Post publicado"}! <a href="./#/post/${esc(res.post.slug)}" target="_blank" rel="noopener">Abrir post ↗</a>`,
         "ok",
         10000
       );
     } catch (err) {
-      toast(errMsg(err), "error", 9000);
+      toast(esc(err.message), "error", 9000);
     } finally {
       setBusy(false);
     }
@@ -1248,18 +894,15 @@
 
   async function removePost(post) {
     if (busy) return;
-    if (!confirm(`Excluir o post "${post.title}"?\n\nEle some do site em cerca de 1 minuto.`)) return;
+    if (!confirm(`Excluir o post "${post.title}"?`)) return;
     busy = true;
     try {
-      const { list, sha } = await fetchPosts();
-      const next = list.filter((p) => p.slug !== post.slug);
-      await putJSON(POSTS_PATH, next, `Remove post: ${post.title}`, sha);
-      posts = next;
+      posts = (await call(`/posts/${encodeURIComponent(post.slug)}`, { method: "DELETE" })).posts;
       if (editing === post.slug) resetForm();
       renderList();
       toast("🗑️ Post excluído.");
     } catch (err) {
-      toast(errMsg(err), "error", 9000);
+      toast(esc(err.message), "error", 9000);
     } finally {
       busy = false;
     }
@@ -1270,14 +913,12 @@
     if (busy || pending.size) { e.preventDefault(); e.returnValue = ""; }
   });
 
-  async function init() {
-    document.title = `${PAGE === "setup" ? "Configuração" : "Admin"} · ${SITE.name}`;
+  function init() {
+    document.title = `Admin · ${SITE.name}`;
     if (!window.crypto || !crypto.subtle) {
       app.innerHTML = `<p class="loading">⚠️ Abra o painel pelo endereço com <strong>https://</strong> para o login funcionar.</p>`;
       return;
     }
-    access = await loadAccess();
-    if (PAGE === "setup") return viewOwner();
     session = store.get(SESSION_KEY);
     if (session && session.token) openDashboard();
     else viewLogin();
