@@ -36,17 +36,9 @@ Aqui você vai encontrar reviews, listas, guias pra quem está começando e muit
 
   /*
     🚀 LANÇAMENTO DO SITE
-    Até essa data, quem entrar no site vê só a tela "Em breve" com o cronômetro.
-    Depois dela, o blog abre sozinho (não precisa mexer em nada).
-    Pra espiar o site antes do lançamento, abra o endereço com ?preview no final:
-      https://SEU-USUARIO.github.io/SEU-REPO/?preview
-    Pra desligar a tela de lançamento, apague a data: date: ""
+    Agora é configurado pelo painel admin (admin.html → "Cronômetro de lançamento"),
+    que salva em data/site.json. Pra espiar o site enquanto ele está fechado: /?preview
   */
-  launch: {
-    date: "2026-10-28T12:00:00-03:00",
-    title: "Está chegando!",
-    message: "Um cantinho novo pra falar de Disney, BTS e Fórmula 1. Volta aqui quando o cronômetro zerar 💜",
-  },
 
   events: [
     // 💜 BTS — ARIRANG World Tour em São Paulo (Estádio MorumBIS, show às 20h)

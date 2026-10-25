@@ -1,8 +1,12 @@
 /*
   ✏️ PAINEL ADMIN
-  - Login com email e senha. A chave do GitHub (token) fica guardada CRIPTOGRAFADA em data/access.json:
-    só quem sabe o email + senha certos consegue destravá-la (AES-GCM + PBKDF2, direto no navegador).
-  - Publica posts no repositório (data/posts.json) e imagens em img/ e img/stickers/.
+  Login com usuário (ou email) e senha, sem servidor:
+  - Cada pessoa tem um par de chaves RSA. A chave PRIVADA fica guardada criptografada com a
+    senha dela (PBKDF2 + AES-GCM). A chave do GitHub (token) fica trancada com a chave PÚBLICA.
+  - Senha certa → abre a chave privada → abre o token → publica no repositório.
+  - Trocar senha gera um par novo. Renovar o token não precisa da senha de ninguém
+    (é só trancar o token novo com as chaves públicas de todo mundo).
+  Arquivos: data/access.json (acessos), data/posts.json (posts), data/site.json (lançamento).
 */
 (() => {
   const { md, esc, isImage, icon } = window.MD;
@@ -16,11 +20,17 @@
 
   const POSTS_PATH = "data/posts.json";
   const ACCESS_PATH = "data/access.json";
+  const SITE_PATH = "data/site.json";
   const STICKERS_DIR = "img/stickers";
   const DRAFT_KEY = "admin-draft";
   const SESSION_KEY = "admin-session";
   const ITERATIONS = 600000;
-  const MIN_PASSWORD = 10;
+  const MIN_PASSWORD = 8;
+  const DEFAULT_TEMP = "123mudar";
+  const DEFAULT_PEOPLE = [
+    { name: "Aysllan", login: "aysllan" },
+    { name: "Bia", login: "bia" },
+  ];
 
   const app = document.getElementById("admin-app");
   const toastEl = document.getElementById("toast");
@@ -29,12 +39,14 @@
 
   let session = null; // { owner, repo, branch, token, id, name }
   let access = null; // conteúdo de data/access.json
+  let siteCfg = { launch: {} };
   let posts = [];
   let stickers = [];
   let editing = null;
   let slugTouched = false;
   let cover = { value: "", fit: "" };
   const pending = new Map(); // caminho → { b64, dataUrl } (imagens ainda não enviadas)
+  const uploaded = new Map(); // imagens já enviadas, mas que o GitHub Pages ainda não publicou
 
   // ---------- armazenamento local ----------
   const store = {
@@ -67,14 +79,23 @@
   const b64ToBytes = (b64) => Uint8Array.from(atob(b64.replace(/\s/g, "")), (c) => c.charCodeAt(0));
   const toB64 = (str) => bytesToB64(new TextEncoder().encode(str));
   const fromB64 = (b64) => new TextDecoder().decode(b64ToBytes(b64));
-  const uploaded = new Map(); // imagens já enviadas, mas que o GitHub Pages ainda não publicou
   const resolveImg = (p) => (pending.has(p) ? pending.get(p).dataUrl : uploaded.get(p) || p);
   const imgTag = (src, fit) => `<img src="${esc(resolveImg(src))}" alt="" class="${fit === "contain" ? "sticker" : ""}">`;
   const coverHTML = (value, fit) => (isImage(value) ? imgTag(value, fit) : `<span>${esc(value || "✨")}</span>`);
   const fmtDay = (iso) => new Date(iso + "T12:00:00").toLocaleDateString("pt-BR", { day: "numeric", month: "short", year: "numeric" });
-  const normEmail = (e) => String(e || "").trim().toLowerCase();
-  const validEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e);
+  const normLogin = (e) => String(e || "").trim().toLowerCase();
+  const validLogin = (e) => /^[a-z0-9._+-]{2,}(@[a-z0-9.-]+\.[a-z]{2,})?$/.test(e);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const now = () => new Date().toISOString();
+
+  // Data/hora de Brasília (UTC-3, sem horário de verão) <-> campo datetime-local
+  const isoToBrt = (iso) => {
+    const d = new Date(iso);
+    return isNaN(d) ? "" : new Date(d.getTime() - 3 * 3600e3).toISOString().slice(0, 16);
+  };
+  const brtToIso = (v) => (v ? `${v}:00-03:00` : "");
+  const fmtBrt = (iso) =>
+    new Date(iso).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo", weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" });
 
   let toastTimer;
   function toast(msg, type = "ok", ms = 6000) {
@@ -85,31 +106,50 @@
     toastTimer = setTimeout(() => (toastEl.hidden = true), ms);
   }
 
-  // ---------- criptografia (email + senha → destrava o token) ----------
+  // ---------- criptografia ----------
   const enc = new TextEncoder();
+  const RSA = { name: "RSA-OAEP", hash: "SHA-256" };
 
-  async function emailId(email) {
-    const hash = await crypto.subtle.digest("SHA-256", enc.encode("cantinho-admin:" + normEmail(email)));
+  async function loginId(login) {
+    const hash = await crypto.subtle.digest("SHA-256", enc.encode("cantinho-admin:" + normLogin(login)));
     return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
   }
 
-  async function deriveKey(email, password, salt, iterations) {
-    const base = await crypto.subtle.importKey("raw", enc.encode(normEmail(email) + "\n" + password), "PBKDF2", false, ["deriveKey"]);
+  async function passwordKey(password, salt, iterations) {
+    const base = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"]);
     return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, base, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
   }
 
-  async function sealUser({ name, email, password }, token) {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const key = await deriveKey(email, password, salt, ITERATIONS);
-    const data = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, enc.encode(JSON.stringify({ token })));
-    return { id: await emailId(email), name, iter: ITERATIONS, salt: bytesToB64(salt), iv: bytesToB64(iv), data: bytesToB64(data) };
+  async function sealToken(pub, token) {
+    const key = await crypto.subtle.importKey("spki", b64ToBytes(pub), RSA, false, ["encrypt"]);
+    return bytesToB64(await crypto.subtle.encrypt(RSA, key, enc.encode(token)));
   }
 
-  async function openUser(entry, email, password) {
-    const key = await deriveKey(email, password, b64ToBytes(entry.salt), entry.iter || ITERATIONS);
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(entry.iv) }, key, b64ToBytes(entry.data));
-    return JSON.parse(new TextDecoder().decode(plain));
+  // Cria as chaves de uma pessoa protegidas pela senha e tranca o token com elas
+  async function makeKeys(password, token) {
+    const pair = await crypto.subtle.generateKey({ ...RSA, modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]) }, true, ["encrypt", "decrypt"]);
+    const pub = bytesToB64(await crypto.subtle.exportKey("spki", pair.publicKey));
+    const pkcs8 = await crypto.subtle.exportKey("pkcs8", pair.privateKey);
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const key = await passwordKey(password, salt, ITERATIONS);
+    const data = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, pkcs8);
+    return {
+      pub,
+      priv: { iter: ITERATIONS, salt: bytesToB64(salt), iv: bytesToB64(iv), data: bytesToB64(data) },
+      token: await sealToken(pub, token),
+    };
+  }
+
+  async function makeUser({ name, login, password, temp }, token) {
+    return { id: await loginId(login), name, ...(await makeKeys(password, token)), mustChange: !!temp, updated: now() };
+  }
+
+  async function unlockToken(entry, password) {
+    const key = await passwordKey(password, b64ToBytes(entry.priv.salt), entry.priv.iter || ITERATIONS);
+    const pkcs8 = await crypto.subtle.decrypt({ name: "AES-GCM", iv: b64ToBytes(entry.priv.iv) }, key, b64ToBytes(entry.priv.data));
+    const priv = await crypto.subtle.importKey("pkcs8", pkcs8, RSA, false, ["decrypt"]);
+    return new TextDecoder().decode(await crypto.subtle.decrypt(RSA, priv, b64ToBytes(entry.token)));
   }
 
   // ---------- API do GitHub ----------
@@ -160,6 +200,17 @@
 
   const putJSON = (path, value, message, sha, who = session) => putFile(path, toB64(JSON.stringify(value, null, 2) + "\n"), message, sha, who);
 
+  // Lê a versão mais nova do access.json, aplica a mudança e salva
+  async function updateAccess(change, message, who = session) {
+    const { value, sha } = await getJSON(ACCESS_PATH, null, who);
+    const next = value && Array.isArray(value.users) ? value : { version: 2, owner: who.owner, repo: who.repo, branch: who.branch, users: [] };
+    await change(next);
+    next.updated = now();
+    await putJSON(ACCESS_PATH, next, message, sha, who);
+    access = next;
+    return next;
+  }
+
   async function fetchPosts() {
     const { value, sha } = await getJSON(POSTS_PATH, []);
     return { list: Array.isArray(value) ? value : [], sha };
@@ -175,7 +226,7 @@
   }
 
   function errMsg(e) {
-    if (e.status === 401) return "🔑 O acesso ao GitHub expirou. O dono do site precisa renovar a chave em “Configurar acesso”.";
+    if (e.status === 401) return "🔑 A chave do GitHub expirou ou foi apagada. Quem é dono(a) do site precisa renovar a chave.";
     if (e.status === 403) return "🚫 A chave do GitHub não tem permissão de escrita (Contents: Read and write).";
     if (e.status === 404) return "🔍 Repositório não encontrado, ou a chave não tem acesso a ele.";
     if (e.status === 409 || e.status === 422) return "⚠️ O arquivo mudou enquanto você editava. Tente de novo.";
@@ -193,7 +244,7 @@
   function expireSession() {
     store.del(SESSION_KEY);
     session = null;
-    setTimeout(() => viewLogin(), 50);
+    setTimeout(() => viewLogin("Sua sessão expirou. Entre de novo."), 50);
   }
 
   logoutEl.addEventListener("click", (e) => {
@@ -209,7 +260,7 @@
       const r = await fetch(ACCESS_PATH, { cache: "no-cache" });
       if (!r.ok) return null;
       const a = await r.json();
-      return a && Array.isArray(a.users) && a.users.length ? a : null;
+      return a && a.version === 2 && Array.isArray(a.users) && a.users.length ? a : null;
     } catch (e) {
       return null;
     }
@@ -228,8 +279,22 @@
     subEl.textContent = loggedIn ? `Olá, ${session.name || "admin"} 👋` : "Escreva e publique posts";
   }
 
+  const passwordFields = (label = "Nova senha") => `
+    <div class="row">
+      <label>${label}<input name="password" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password"></label>
+      <label>Repetir senha<input name="password2" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password"></label>
+    </div>`;
+
+  function checkNewPassword(f) {
+    const p = f.password.value;
+    if (p.length < MIN_PASSWORD) throw new Error(`A senha precisa ter pelo menos ${MIN_PASSWORD} caracteres.`);
+    if (p !== f.password2.value) throw new Error("As duas senhas não são iguais.");
+    if (p === DEFAULT_TEMP) throw new Error("Escolha uma senha diferente da provisória.");
+    return p;
+  }
+
   // ---------- login ----------
-  function viewLogin(message) {
+  function viewLogin(message, ok) {
     setHeader(false);
     if (!access) return viewSetup();
     app.innerHTML = `
@@ -237,48 +302,50 @@
         <p class="eyebrow">🔐 Entrar</p>
         <h1>Painel do ${esc(SITE.name)}</h1>
         <form id="login-form" class="form">
-          <label>Email<input name="email" type="email" required autocomplete="username" placeholder="voce@email.com"></label>
+          <label>Usuário<input name="login" required autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="ex: bia"></label>
           <label>Senha<input name="password" type="password" required autocomplete="current-password"></label>
-          <label class="check"><input type="checkbox" name="remember"> Continuar conectada neste aparelho</label>
+          <label class="check"><input type="checkbox" name="remember"> Continuar conectado(a) neste aparelho</label>
           <button class="btn primary" type="submit">Entrar</button>
-          <p class="form-error" id="login-error" ${message ? "" : "hidden"}>${esc(message || "")}</p>
+          <p class="${ok ? "form-ok" : "form-error"}" id="login-msg" ${message ? "" : "hidden"}>${esc(message || "")}</p>
         </form>
-        <p class="muted small">Esqueceu a senha? Peça pra quem administra o site criar uma nova pra você.</p>
+        <p class="muted small">Primeiro acesso? Use a senha provisória que você recebeu. Logo depois o painel pede pra você criar a sua.</p>
         <details class="help">
           <summary>Sou dono(a) do site</summary>
-          <p class="muted small">Use isso pra configurar o acesso do zero ou renovar a chave do GitHub quando ela vencer. Todo mundo vai precisar de senha nova.</p>
-          <button type="button" class="btn ghost" id="go-setup">⚙️ Configurar acesso</button>
+          <p class="muted small">Configurar do zero apaga todos os acessos e cria de novo com senha provisória. Pra só trocar a chave do GitHub, entre normalmente e use “Chave do GitHub”.</p>
+          <button type="button" class="btn ghost" id="go-setup">⚙️ Configurar do zero</button>
         </details>
       </section>`;
 
     app.querySelector("#go-setup").addEventListener("click", () => viewSetup());
     const form = app.querySelector("#login-form");
-    form.email.focus();
+    form.login.focus();
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const btn = form.querySelector("button[type=submit]");
-      const errEl = app.querySelector("#login-error");
-      errEl.hidden = true;
+      const msgEl = app.querySelector("#login-msg");
+      msgEl.hidden = true;
+      msgEl.className = "form-error";
       btn.disabled = true;
       btn.textContent = "Entrando…";
-      const email = normEmail(form.email.value);
+      const login = normLogin(form.login.value);
       const password = form.password.value;
       try {
-        const id = await emailId(email);
+        const id = await loginId(login);
         const entry = access.users.find((u) => u.id === id);
-        let secret = null;
+        let token = null;
         if (entry) {
-          try { secret = await openUser(entry, email, password); } catch (x) { secret = null; }
-        } else await sleep(600);
-        if (!secret) throw Object.assign(new Error("Email ou senha incorretos."), { login: true });
+          try { token = await unlockToken(entry, password); } catch (x) { token = null; }
+        } else await sleep(700);
+        if (!token) throw Object.assign(new Error("Usuário ou senha incorretos."), { login: true });
 
-        const next = { owner: access.owner, repo: access.repo, branch: access.branch || "main", token: secret.token, id, name: entry.name };
+        const next = { owner: access.owner, repo: access.repo, branch: access.branch || "main", token, id, name: entry.name };
         await api("", {}, next);
+        if (entry.mustChange) return viewNewPassword(next, form.remember.checked);
         startSession(next, form.remember.checked);
         await openDashboard();
       } catch (err) {
-        errEl.textContent = err.login ? err.message : errMsg(err);
-        errEl.hidden = false;
+        msgEl.textContent = err.login ? err.message : errMsg(err).replace(/<[^>]+>/g, "");
+        msgEl.hidden = false;
         btn.disabled = false;
         btn.textContent = "Entrar";
         form.password.select();
@@ -286,35 +353,81 @@
     });
   }
 
+  // Primeiro acesso: troca a senha provisória pela definitiva
+  function viewNewPassword(who, remember) {
+    setHeader(false);
+    app.innerHTML = `
+      <section class="panel login">
+        <p class="eyebrow">🔑 Primeiro acesso</p>
+        <h1>Oi, ${esc(who.name)}! Crie sua senha</h1>
+        <p class="muted">Você entrou com a senha provisória. Escolha agora a sua senha (mínimo ${MIN_PASSWORD} caracteres). Ela fica registrada e passa a valer no próximo login.</p>
+        <form id="newpass-form" class="form">
+          ${passwordFields()}
+          <button class="btn primary" type="submit">Salvar minha senha</button>
+          <p class="form-error" id="newpass-error" hidden></p>
+        </form>
+      </section>`;
+    const form = app.querySelector("#newpass-form");
+    form.password.focus();
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const errEl = app.querySelector("#newpass-error");
+      const btn = form.querySelector("button");
+      errEl.hidden = true;
+      let password;
+      try {
+        password = checkNewPassword(form);
+      } catch (err) {
+        errEl.textContent = err.message;
+        errEl.hidden = false;
+        return;
+      }
+      btn.disabled = true;
+      btn.textContent = "Registrando…";
+      try {
+        const keys = await makeKeys(password, who.token);
+        await updateAccess((a) => {
+          const u = a.users.find((x) => x.id === who.id);
+          if (!u) throw new Error("Seu acesso não existe mais. Fale com quem administra o site.");
+          Object.assign(u, keys, { mustChange: false, updated: now() });
+        }, `${who.name} definiu a própria senha`, who);
+        startSession(who, remember);
+        await openDashboard();
+        toast("✅ Senha registrada! Da próxima vez, entre com a senha nova.", "ok", 8000);
+      } catch (err) {
+        errEl.innerHTML = err.status ? errMsg(err) : esc(err.message);
+        errEl.hidden = false;
+        btn.disabled = false;
+        btn.textContent = "Salvar minha senha";
+      }
+    });
+  }
+
   // ---------- configuração inicial (dono do repositório) ----------
-  const personHTML = (i) => `
+  const personHTML = (p = {}, i = 0) => `
     <fieldset class="person">
       <legend>Pessoa ${i + 1}</legend>
       <div class="row">
-        <label>Nome<input name="name" required placeholder="Ex: Ana"></label>
-        <label>Email<input name="email" type="email" required autocomplete="off"></label>
+        <label>Nome<input name="name" required value="${esc(p.name || "")}"></label>
+        <label>Usuário<input name="login" required autocapitalize="none" spellcheck="false" value="${esc(p.login || "")}" placeholder="ex: bia"></label>
       </div>
-      <div class="row">
-        <label>Senha<input name="password" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password"></label>
-        <label>Repetir senha<input name="password2" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password"></label>
-      </div>
+      <label>Senha provisória<input name="password" required value="${esc(DEFAULT_TEMP)}" autocomplete="off"></label>
     </fieldset>`;
 
   function readPeople(root) {
     const people = [...root.querySelectorAll(".person")].map((fs) => ({
       name: fs.querySelector("[name=name]").value.trim(),
-      email: normEmail(fs.querySelector("[name=email]").value),
+      login: normLogin(fs.querySelector("[name=login]").value),
       password: fs.querySelector("[name=password]").value,
-      password2: fs.querySelector("[name=password2]").value,
+      temp: true,
     }));
     const seen = new Set();
     for (const p of people) {
       if (!p.name) throw new Error("Preencha o nome de todo mundo.");
-      if (!validEmail(p.email)) throw new Error(`Email inválido: ${p.email || "(vazio)"}`);
-      if (seen.has(p.email)) throw new Error(`O email ${p.email} aparece duas vezes.`);
-      seen.add(p.email);
-      if (p.password.length < MIN_PASSWORD) throw new Error(`A senha de ${p.name} precisa ter pelo menos ${MIN_PASSWORD} caracteres.`);
-      if (p.password !== p.password2) throw new Error(`As senhas de ${p.name} não são iguais.`);
+      if (!validLogin(p.login)) throw new Error(`Usuário inválido: “${p.login || "(vazio)"}”. Use letras minúsculas, números, ponto ou um email.`);
+      if (seen.has(p.login)) throw new Error(`O usuário ${p.login} aparece duas vezes.`);
+      seen.add(p.login);
+      if (p.password.length < 6) throw new Error(`A senha provisória de ${p.name} precisa ter pelo menos 6 caracteres.`);
     }
     return people;
   }
@@ -326,35 +439,26 @@
       <section class="panel login setup">
         <p class="eyebrow">⚙️ Configuração</p>
         <h1>Configurar acesso</h1>
-        <p class="muted">Feito uma vez só, por quem é dono(a) do repositório no GitHub. Aqui você conecta o painel ao GitHub e cria o <strong>email e senha</strong> de quem vai escrever no blog.</p>
+        <p class="muted">Feito uma vez só, por quem é dono(a) do repositório no GitHub. Conecta o painel ao GitHub e cria os usuários com <strong>senha provisória</strong>. No primeiro login cada pessoa cria a própria senha.</p>
+        ${access ? '<p class="form-error">⚠️ Isso substitui todos os acessos atuais.</p>' : ""}
 
         <form id="setup-form" class="form">
           <h3>1. Repositório do site</h3>
           <div class="row">
-            <label>Usuário do GitHub<input name="owner" required value="${esc(g.owner || "")}"></label>
-            <label>Repositório<input name="repo" required value="${esc(g.repo || "")}"></label>
+            <label>Usuário do GitHub<input name="owner" required value="${esc(g.owner || "")}" placeholder="ex: Proddy-0"></label>
+            <label>Repositório<input name="repo" required value="${esc(g.repo || "")}" placeholder="ex: cantinho-magico"></label>
           </div>
           <label>Branch<input name="branch" required value="${esc(g.branch || "main")}"></label>
 
           <h3>2. Chave do GitHub</h3>
           <label>Token<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
-          <details class="help">
-            <summary>Como criar a chave</summary>
-            <ol>
-              <li>Abra <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained token</a>.</li>
-              <li>Nome: <em>painel do blog</em>. Escolha a validade (quando vencer, é só voltar aqui e configurar de novo).</li>
-              <li><strong>Repository access</strong> → <em>Only select repositories</em> → escolha o repositório do blog.</li>
-              <li><strong>Permissions → Repository permissions → Contents</strong> → <em>Read and write</em>.</li>
-              <li><strong>Generate token</strong>, copie e cole acima.</li>
-            </ol>
-          </details>
+          ${tokenHelp()}
 
-          <h3>3. Quem pode entrar no painel</h3>
-          <div id="people">${personHTML(0)}</div>
+          <h3>3. Quem pode entrar</h3>
+          <div id="people">${DEFAULT_PEOPLE.map(personHTML).join("")}</div>
           <button type="button" class="btn ghost" id="add-person">＋ Adicionar outra pessoa</button>
-          <p class="muted small">🔒 A chave fica salva no site <strong>criptografada</strong> com o email e a senha de cada pessoa. Sem a senha certa, ninguém consegue usar. Use senhas fortes (mínimo ${MIN_PASSWORD} caracteres).</p>
 
-          <button class="btn primary" type="submit">Salvar e entrar</button>
+          <button class="btn primary" type="submit">Salvar acessos</button>
           <p class="form-error" id="setup-error" hidden></p>
           ${access ? '<button type="button" class="btn ghost" id="back-login">← Voltar pro login</button>' : ""}
         </form>
@@ -362,8 +466,10 @@
 
     const form = app.querySelector("#setup-form");
     const people = app.querySelector("#people");
+    if (!form.owner.value) form.owner.value = "Proddy-0";
+    if (!form.repo.value) form.repo.value = "cantinho-magico";
     app.querySelector("#add-person").addEventListener("click", () => {
-      people.insertAdjacentHTML("beforeend", personHTML(people.children.length));
+      people.insertAdjacentHTML("beforeend", personHTML({}, people.children.length));
     });
     app.querySelector("#back-login")?.addEventListener("click", () => viewLogin());
 
@@ -380,46 +486,66 @@
         errEl.hidden = false;
         return;
       }
-      const who = {
-        owner: form.owner.value.trim(),
-        repo: form.repo.value.trim(),
-        branch: form.branch.value.trim() || "main",
-        token: form.token.value.trim(),
-      };
+      const who = { owner: form.owner.value.trim(), repo: form.repo.value.trim(), branch: form.branch.value.trim() || "main", token: form.token.value.trim() };
+      if (who.token.length > 180) {
+        errEl.textContent = "Esse token é grande demais. Use um Fine-grained token do GitHub.";
+        errEl.hidden = false;
+        return;
+      }
       btn.disabled = true;
       try {
         btn.textContent = "Testando a chave…";
         const repo = await api("", {}, who);
         if (repo.permissions && !repo.permissions.push) throw Object.assign(new Error(), { status: 403 });
 
-        btn.textContent = "Criptografando…";
         const users = [];
-        for (const p of list) users.push(await sealUser(p, who.token));
+        for (const p of list) {
+          btn.textContent = `Criando acesso de ${p.name}…`;
+          users.push(await makeUser(p, who.token));
+        }
 
         btn.textContent = "Salvando…";
         const current = await getFile(ACCESS_PATH, who);
-        const next = { owner: who.owner, repo: who.repo, branch: who.branch, users, updated: new Date().toISOString() };
+        const next = { version: 2, owner: who.owner, repo: who.repo, branch: who.branch, users, tokenExposed: true, updated: now() };
         await putJSON(ACCESS_PATH, next, "Configura acesso ao painel admin", current && current.sha, who);
         access = next;
-
-        startSession({ ...who, id: users[0].id, name: list[0].name }, false);
-        await openDashboard();
-        toast("✅ Acesso configurado! A partir de agora é só entrar com email e senha. (O login novo vale no site em ~1 minuto.)", "ok", 10000);
+        viewLogin("✅ Acessos criados! Entre com seu usuário e a senha provisória.", true);
       } catch (err) {
         errEl.innerHTML = errMsg(err);
         errEl.hidden = false;
         btn.disabled = false;
-        btn.textContent = "Salvar e entrar";
+        btn.textContent = "Salvar acessos";
       }
     });
   }
 
+  const tokenHelp = () => `
+    <details class="help">
+      <summary>Como criar a chave</summary>
+      <ol>
+        <li>Abra <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained token</a>.</li>
+        <li>Nome: <em>painel do blog</em>. Escolha a validade (quando vencer, é só renovar aqui no painel).</li>
+        <li><strong>Repository access</strong> → <em>Only select repositories</em> → o repositório do blog.</li>
+        <li><strong>Permissions → Repository permissions → Contents</strong> → <em>Read and write</em>.</li>
+        <li><strong>Generate token</strong>, copie e cole aqui.</li>
+      </ol>
+    </details>`;
+
   // ---------- painel ----------
   async function openDashboard() {
     setHeader(true);
-    app.innerHTML = `<p class="loading">Carregando posts…</p>`;
+    app.innerHTML = `<p class="loading">Carregando…</p>`;
     try {
-      [posts, stickers] = await Promise.all([fetchPosts().then((r) => r.list), listStickers()]);
+      const [p, s, cfg, acc] = await Promise.all([
+        fetchPosts().then((r) => r.list),
+        listStickers(),
+        getJSON(SITE_PATH, { launch: {} }).then((r) => r.value),
+        getJSON(ACCESS_PATH, null).then((r) => r.value),
+      ]);
+      posts = p;
+      stickers = s;
+      siteCfg = cfg || { launch: {} };
+      if (acc) access = acc;
     } catch (err) {
       if (session) app.innerHTML = `<p class="loading">${errMsg(err)}</p>`;
       toast(errMsg(err), "error");
@@ -430,6 +556,7 @@
 
   function renderDashboard() {
     app.innerHTML = `
+      <div id="security-banner"></div>
       <div class="admin-grid">
         <section class="panel">
           <form id="editor" class="form" autocomplete="off">
@@ -505,24 +632,53 @@
         <ul class="post-list" id="post-list"></ul>
       </section>
 
+      <section class="panel" id="launch-panel">
+        <div class="panel-head">
+          <h2>🚀 Cronômetro de lançamento</h2>
+          <span class="badge" id="launch-badge"></span>
+        </div>
+        <form id="launch-form" class="form">
+          <label class="check switch"><input type="checkbox" name="enabled"> Ativar: o site fica fechado mostrando o cronômetro até a data abaixo</label>
+          <label>Abre em <small class="muted">(horário de Brasília)</small><input type="datetime-local" name="date" required></label>
+          <label>Título<input name="title" maxlength="80"></label>
+          <label>Mensagem<textarea name="message" rows="2" maxlength="240"></textarea></label>
+          <p class="muted small" id="launch-info"></p>
+          <div class="actions"><button type="submit" class="btn">💾 Salvar cronômetro</button></div>
+        </form>
+      </section>
+
       <section class="panel">
         <div class="panel-head"><h2>👥 Quem pode entrar</h2></div>
         <ul class="people-list" id="people-list"></ul>
         <details class="help">
-          <summary>＋ Adicionar pessoa ou trocar senha</summary>
+          <summary>＋ Adicionar pessoa</summary>
           <form id="person-form" class="form">
             <div class="row">
               <label>Nome<input name="name" required></label>
-              <label>Email<input name="email" type="email" required autocomplete="off"></label>
+              <label>Usuário<input name="login" required autocapitalize="none" spellcheck="false" placeholder="ex: maria"></label>
             </div>
-            <div class="row">
-              <label>Senha<input name="password" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password"></label>
-              <label>Repetir senha<input name="password2" type="password" required minlength="${MIN_PASSWORD}" autocomplete="new-password"></label>
-            </div>
-            <p class="muted small">Se o email já tiver acesso, a senha dele é trocada pela nova.</p>
-            <button type="submit" class="btn">Salvar acesso</button>
+            <label>Senha provisória<input name="password" required value="${esc(DEFAULT_TEMP)}" autocomplete="off"></label>
+            <p class="muted small">No primeiro login a pessoa cria a própria senha.</p>
+            <button type="submit" class="btn">Criar acesso</button>
           </form>
         </details>
+        <details class="help">
+          <summary>🔒 Trocar minha senha</summary>
+          <form id="mypass-form" class="form">
+            ${passwordFields()}
+            <button type="submit" class="btn">Salvar nova senha</button>
+          </form>
+        </details>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>🔑 Chave do GitHub</h2></div>
+        <p class="muted small">Quando a chave vencer (ou por segurança), crie uma nova no GitHub e cole aqui. Ninguém precisa trocar de senha.</p>
+        <form id="token-form" class="form">
+          <label>Nova chave (token)<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
+          ${tokenHelp()}
+          <div class="actions"><button type="submit" class="btn">Renovar chave</button></div>
+        </form>
       </section>`;
 
     const form = app.querySelector("#editor");
@@ -604,14 +760,21 @@
       if (b.dataset.act === "delete") removePost(post);
     });
 
-    app.querySelector("#person-form").addEventListener("submit", savePerson);
+    app.querySelector("#launch-form").addEventListener("submit", saveLaunch);
+    app.querySelector("#launch-form").addEventListener("input", renderLaunchInfo);
+    app.querySelector("#person-form").addEventListener("submit", addPerson);
+    app.querySelector("#mypass-form").addEventListener("submit", changeMyPassword);
+    app.querySelector("#token-form").addEventListener("submit", renewToken);
     app.querySelector("#people-list").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-id]");
-      if (b) removePerson(b.dataset.id);
+      if (!b) return;
+      if (b.dataset.act === "reset") resetPerson(b.dataset.id);
+      if (b.dataset.act === "remove") removePerson(b.dataset.id);
     });
 
     renderList();
     renderPeople();
+    fillLaunch();
     const draft = store.get(DRAFT_KEY);
     if (draft) {
       fillForm(draft.post, draft.editing);
@@ -651,14 +814,219 @@
         .map(
           (u) => `
         <li>
-          <span>👤 <strong>${esc(u.name || "Sem nome")}</strong>${u.id === session.id ? ' <small class="muted">(você)</small>' : ""}</span>
-          ${users.length > 1 ? `<button class="btn danger" data-id="${esc(u.id)}">Remover</button>` : ""}
+          <span>👤 <strong>${esc(u.name || "Sem nome")}</strong>${u.id === session.id ? ' <small class="muted">(você)</small>' : ""}
+            ${u.mustChange ? '<span class="badge warn">senha provisória</span>' : ""}</span>
+          <span class="pl-actions">
+            ${u.id !== session.id ? `<button class="btn ghost" data-act="reset" data-id="${esc(u.id)}">Resetar senha</button>` : ""}
+            ${users.length > 1 ? `<button class="btn danger" data-act="remove" data-id="${esc(u.id)}">Remover</button>` : ""}
+          </span>
         </li>`
         )
         .join("") || '<li class="muted">Ninguém configurado.</li>';
+    renderBanner();
   }
 
-  // ---------- formulário ----------
+  // Depois que todo mundo trocou a senha provisória, pede pra renovar a chave do GitHub uma vez
+  function renderBanner() {
+    const users = (access && access.users) || [];
+    const waiting = users.filter((u) => u.mustChange).map((u) => u.name);
+    const el = app.querySelector("#security-banner");
+    if (!access || !access.tokenExposed) return (el.innerHTML = "");
+    el.innerHTML = waiting.length
+      ? `<div class="banner">⏳ Aguardando ${esc(waiting.join(" e "))} entrar e criar a própria senha. Depois disso, renove a chave do GitHub (lá embaixo) pra concluir a segurança.</div>`
+      : `<div class="banner warn">🔒 Todo mundo já criou a própria senha! Último passo: <a href="#token-form">renove a chave do GitHub</a>. Assim a senha provisória que ficou no histórico do site não serve pra mais nada.</div>`;
+  }
+
+  // ---------- cronômetro de lançamento ----------
+  function fillLaunch() {
+    const f = app.querySelector("#launch-form");
+    const l = siteCfg.launch || {};
+    f.enabled.checked = !!l.enabled;
+    f.date.value = isoToBrt(l.date || "2026-11-01T20:00:00-03:00");
+    f.title.value = l.title || "Está chegando!";
+    f.message.value = l.message || "";
+    renderLaunchInfo();
+  }
+
+  function renderLaunchInfo() {
+    const f = app.querySelector("#launch-form");
+    const iso = brtToIso(f.date.value);
+    const on = f.enabled.checked;
+    const saved = siteCfg.launch || {};
+    const badge = app.querySelector("#launch-badge");
+    badge.textContent = saved.enabled ? "LIGADO" : "DESLIGADO";
+    badge.className = `badge ${saved.enabled ? "on" : ""}`;
+    const past = iso && new Date(iso) <= Date.now();
+    app.querySelector("#launch-info").innerHTML = !iso
+      ? ""
+      : on
+        ? past
+          ? "⚠️ Essa data já passou: o site vai continuar aberto."
+          : `O site fica fechado até <strong>${esc(fmtBrt(iso))}</strong> e abre sozinho quando o cronômetro zerar. Pra espiar enquanto está fechado: <a href="./?preview" target="_blank" rel="noopener">abrir com ?preview</a>.`
+        : "Desligado: o site fica aberto normalmente.";
+  }
+
+  async function saveLaunch(e) {
+    e.preventDefault();
+    const f = e.target;
+    const btn = f.querySelector("button[type=submit]");
+    const launch = {
+      enabled: f.enabled.checked,
+      date: brtToIso(f.date.value),
+      title: f.title.value.trim() || "Está chegando!",
+      message: f.message.value.trim(),
+    };
+    btn.disabled = true;
+    btn.textContent = "Salvando…";
+    try {
+      const { value, sha } = await getJSON(SITE_PATH, {});
+      const next = { ...(value || {}), launch };
+      await putJSON(SITE_PATH, next, `${launch.enabled ? "Liga" : "Desliga"} cronômetro de lançamento`, sha);
+      siteCfg = next;
+      renderLaunchInfo();
+      toast(launch.enabled ? `🚀 Cronômetro ligado até ${esc(fmtBrt(launch.date))}. Vale no site em ~1 minuto.` : "✅ Cronômetro desligado. O site fica aberto (em ~1 minuto).", "ok", 8000);
+    } catch (err) {
+      toast(errMsg(err), "error", 9000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "💾 Salvar cronômetro";
+    }
+  }
+
+  // ---------- pessoas ----------
+  async function addPerson(e) {
+    e.preventDefault();
+    const f = e.target;
+    const btn = f.querySelector("button[type=submit]");
+    let person;
+    try {
+      [person] = readPeople({ querySelectorAll: () => [f] });
+    } catch (err) {
+      return toast(esc(err.message), "error");
+    }
+    btn.disabled = true;
+    btn.textContent = "Criando…";
+    try {
+      const entry = await makeUser(person, session.token);
+      await updateAccess((a) => {
+        if (a.users.some((u) => u.id === entry.id)) throw new Error(`O usuário ${person.login} já existe. Use “Resetar senha”.`);
+        a.users.push(entry);
+        a.tokenExposed = true;
+      }, `Dá acesso a ${person.name}`);
+      renderPeople();
+      f.reset();
+      f.closest("details").open = false;
+      toast(`✅ Acesso criado para ${esc(person.name)} (usuário <strong>${esc(person.login)}</strong>, senha provisória). Vale em ~1 minuto.`, "ok", 9000);
+    } catch (err) {
+      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Criar acesso";
+    }
+  }
+
+  async function resetPerson(id) {
+    const user = access.users.find((u) => u.id === id);
+    if (!user) return;
+    const temp = prompt(`Senha provisória pra ${user.name}:\n(no próximo login, ${user.name} cria uma senha nova)`, DEFAULT_TEMP);
+    if (temp === null) return;
+    if (temp.length < 6) return toast("A senha provisória precisa ter pelo menos 6 caracteres.", "error");
+    try {
+      const keys = await makeKeys(temp, session.token);
+      await updateAccess((a) => {
+        const u = a.users.find((x) => x.id === id);
+        if (!u) throw new Error("Esse acesso não existe mais.");
+        Object.assign(u, keys, { mustChange: true, updated: now() });
+        a.tokenExposed = true;
+      }, `Reseta a senha de ${user.name}`);
+      renderPeople();
+      toast(`🔄 Senha de ${esc(user.name)} resetada para a provisória.`);
+    } catch (err) {
+      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+    }
+  }
+
+  async function removePerson(id) {
+    const user = (access.users || []).find((u) => u.id === id);
+    if (!user) return;
+    const self = id === session.id;
+    if (!confirm(`Remover o acesso de ${user.name}?${self ? "\n\nVocê não vai mais conseguir entrar com esse usuário." : ""}`)) return;
+    try {
+      await updateAccess((a) => {
+        if (a.users.length <= 1) throw new Error("Precisa ficar pelo menos uma pessoa com acesso.");
+        a.users = a.users.filter((u) => u.id !== id);
+      }, `Remove acesso de ${user.name}`);
+      renderPeople();
+      toast(`🗑️ Acesso de ${esc(user.name)} removido. Por segurança, renove a chave do GitHub.`, "ok", 9000);
+    } catch (err) {
+      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+    }
+  }
+
+  async function changeMyPassword(e) {
+    e.preventDefault();
+    const f = e.target;
+    const btn = f.querySelector("button[type=submit]");
+    let password;
+    try {
+      password = checkNewPassword(f);
+    } catch (err) {
+      return toast(esc(err.message), "error");
+    }
+    btn.disabled = true;
+    btn.textContent = "Salvando…";
+    try {
+      const keys = await makeKeys(password, session.token);
+      await updateAccess((a) => {
+        const u = a.users.find((x) => x.id === session.id);
+        if (!u) throw new Error("Seu acesso não existe mais.");
+        Object.assign(u, keys, { mustChange: false, updated: now() });
+      }, `${session.name} trocou a senha`);
+      renderPeople();
+      f.reset();
+      f.closest("details").open = false;
+      toast("✅ Senha trocada!");
+    } catch (err) {
+      toast(err.status ? errMsg(err) : esc(err.message), "error", 9000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Salvar nova senha";
+    }
+  }
+
+  // Tranca o token novo com a chave pública de cada pessoa (ninguém precisa trocar de senha)
+  async function renewToken(e) {
+    e.preventDefault();
+    const f = e.target;
+    const btn = f.querySelector("button[type=submit]");
+    const token = f.token.value.trim();
+    if (token.length > 180) return toast("Esse token é grande demais. Use um Fine-grained token.", "error");
+    btn.disabled = true;
+    btn.textContent = "Testando…";
+    try {
+      const who = { ...session, token };
+      const repo = await api("", {}, who);
+      if (repo.permissions && !repo.permissions.push) throw Object.assign(new Error(), { status: 403 });
+      btn.textContent = "Salvando…";
+      await updateAccess(async (a) => {
+        for (const u of a.users) u.token = await sealToken(u.pub, token);
+        a.tokenExposed = a.users.some((u) => u.mustChange);
+      }, "Renova a chave do GitHub do painel", who);
+      let remembered = false;
+      try { remembered = !!localStorage.getItem(SESSION_KEY); } catch (x) {}
+      startSession({ ...session, token }, remembered);
+      f.reset();
+      renderPeople();
+      toast("✅ Chave renovada! Agora apague a chave antiga no GitHub (Settings → Developer settings → Fine-grained tokens).", "ok", 12000);
+    } catch (err) {
+      toast(errMsg(err), "error", 9000);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Renovar chave";
+    }
+  }
+
+  // ---------- formulário de post ----------
   const form = () => app.querySelector("#editor");
 
   function readForm() {
@@ -866,7 +1234,6 @@
     if (!post.title || !post.body || !CATS[post.category]) return toast("Preencha título, categoria e texto.", "error");
 
     try {
-      // 1) envia só as imagens usadas no post
       const used = [...pending.keys()].filter((p) => post.body.includes(p) || post.cover === p);
       for (let i = 0; i < used.length; i++) {
         setBusy(true, `Enviando imagem ${i + 1}/${used.length}…`);
@@ -876,7 +1243,6 @@
         pending.delete(used[i]);
       }
 
-      // 2) pega a versão mais nova da lista e salva
       setBusy(true, "Publicando…");
       const { list, sha } = await fetchPosts();
       const idx = editing ? list.findIndex((p) => p.slug === editing) : -1;
@@ -920,60 +1286,6 @@
     }
   }
 
-  // ---------- pessoas com acesso ----------
-  async function savePerson(e) {
-    e.preventDefault();
-    const f = e.target;
-    const btn = f.querySelector("button[type=submit]");
-    let person;
-    try {
-      [person] = readPeople({ querySelectorAll: () => [f] });
-    } catch (err) {
-      return toast(esc(err.message), "error");
-    }
-    btn.disabled = true;
-    btn.textContent = "Salvando…";
-    try {
-      const entry = await sealUser(person, session.token);
-      const { value, sha } = await getJSON(ACCESS_PATH, null);
-      const base = value && Array.isArray(value.users) ? value : { owner: session.owner, repo: session.repo, branch: session.branch, users: [] };
-      const existed = base.users.some((u) => u.id === entry.id);
-      base.users = base.users.filter((u) => u.id !== entry.id).concat(entry);
-      base.updated = new Date().toISOString();
-      await putJSON(ACCESS_PATH, base, `${existed ? "Troca senha de" : "Dá acesso a"} ${person.name}`, sha);
-      access = base;
-      if (entry.id === session.id) session.name = person.name;
-      renderPeople();
-      f.reset();
-      f.closest("details").open = false;
-      toast(`✅ ${existed ? "Senha trocada" : "Acesso criado"} para ${esc(person.name)}. Vale em ~1 minuto.`);
-    } catch (err) {
-      toast(errMsg(err), "error", 9000);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "Salvar acesso";
-    }
-  }
-
-  async function removePerson(id) {
-    const user = (access.users || []).find((u) => u.id === id);
-    if (!user) return;
-    const self = id === session.id;
-    if (!confirm(`Remover o acesso de ${user.name}?${self ? "\n\nVocê não vai mais conseguir entrar com esse email." : ""}`)) return;
-    try {
-      const { value, sha } = await getJSON(ACCESS_PATH, null);
-      if (!value || value.users.length <= 1) return toast("Precisa ficar pelo menos uma pessoa com acesso.", "error");
-      value.users = value.users.filter((u) => u.id !== id);
-      value.updated = new Date().toISOString();
-      await putJSON(ACCESS_PATH, value, `Remove acesso de ${user.name}`, sha);
-      access = value;
-      renderPeople();
-      toast(`🗑️ Acesso de ${esc(user.name)} removido.`);
-    } catch (err) {
-      toast(errMsg(err), "error", 9000);
-    }
-  }
-
   // ---------- início ----------
   window.addEventListener("beforeunload", (e) => {
     if (busy || pending.size) { e.preventDefault(); e.returnValue = ""; }
@@ -982,7 +1294,7 @@
   async function init() {
     document.title = `Admin · ${SITE.name}`;
     if (!window.crypto || !crypto.subtle) {
-      app.innerHTML = `<p class="loading">⚠️ Abra o painel pelo endereço com <strong>https://</strong> (GitHub Pages) para o login funcionar.</p>`;
+      app.innerHTML = `<p class="loading">⚠️ Abra o painel pelo endereço com <strong>https://</strong> para o login funcionar.</p>`;
       return;
     }
     access = await loadAccess();

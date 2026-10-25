@@ -88,9 +88,10 @@
       .sort((a, b) => a.when - b.when);
   }
 
-  // ---------- tela de lançamento ----------
-  const launchDate = SITE.launch && SITE.launch.date ? new Date(SITE.launch.date) : null;
-  const launched = () => !launchDate || isNaN(launchDate) || launchDate <= Date.now();
+  // ---------- tela de lançamento (configurada pelo admin em data/site.json) ----------
+  let LAUNCH = {};
+  let launchDate = null;
+  const launched = () => !LAUNCH.enabled || !launchDate || isNaN(launchDate) || launchDate <= Date.now();
 
   let preview = false;
   try {
@@ -107,10 +108,10 @@
         <div class="launch-emojis" aria-hidden="true">${Object.values(CATS).map((c) => icon(c.icon, "ico float")).join("")}</div>
         <p class="eyebrow">🚀 Lançamento</p>
         <h1>${esc(SITE.name)}</h1>
-        <p class="launch-title">${esc(SITE.launch.title || "Em breve")}</p>
+        <p class="launch-title">${esc(LAUNCH.title || "Em breve")}</p>
         ${clockHTML("big")}
         <p class="ev-date">${fmtDate(launchDate, true)}</p>
-        <p class="launch-msg">${esc(SITE.launch.message || "")}</p>
+        <p class="launch-msg">${esc(LAUNCH.message || "")}</p>
         <p class="launch-tags">${esc(SITE.tagline || "")}</p>
       </section>`;
     document.title = `${SITE.name} · Em breve`;
@@ -307,6 +308,16 @@
     window.scrollTo(0, 0);
   }
 
+  async function loadSiteSettings() {
+    try {
+      const r = await fetch("data/site.json", { cache: "no-cache" });
+      if (r.ok) LAUNCH = (await r.json()).launch || {};
+    } catch (e) {
+      LAUNCH = {};
+    }
+    launchDate = LAUNCH.date ? new Date(LAUNCH.date) : null;
+  }
+
   async function loadPosts() {
     try {
       const r = await fetch("data/posts.json", { cache: "no-cache" });
@@ -329,6 +340,7 @@
     document.getElementById("footer-text").innerHTML =
       `Feito com 💜 · ${esc(SITE.name)} © ${new Date().getFullYear()} · Fã-site sem vínculo oficial com Disney, BTS/HYBE ou Formula 1. · <a href="admin.html">Admin</a>`;
 
+    await loadSiteSettings();
     if (!launched() && !preview) return viewLaunch();
     if (!launched()) {
       const bar = document.createElement("div");
