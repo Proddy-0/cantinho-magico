@@ -27,6 +27,8 @@
   const ITERATIONS = 600000;
   const MIN_PASSWORD = 8;
   const DEFAULT_TEMP = "123mudar";
+  const REPO = { branch: "main", ...(SITE.github || {}) };
+  const PAGE = document.body.dataset.page || "admin"; // "admin" (painel) ou "setup" (dono do site)
   const DEFAULT_PEOPLE = [
     { name: "Aysllan", login: "aysllan" },
     { name: "Bia", login: "bia" },
@@ -266,14 +268,6 @@
     }
   }
 
-  function guessRepo() {
-    const h = location.hostname;
-    if (!h.endsWith(".github.io")) return {};
-    const owner = h.split(".")[0];
-    const seg = location.pathname.split("/").filter(Boolean)[0];
-    return { owner, repo: seg && !seg.endsWith(".html") ? seg : `${owner}.github.io` };
-  }
-
   function setHeader(loggedIn) {
     logoutEl.hidden = !loggedIn;
     subEl.textContent = loggedIn ? `Olá, ${session.name || "admin"} 👋` : "Escreva e publique posts";
@@ -296,7 +290,15 @@
   // ---------- login ----------
   function viewLogin(message, ok) {
     setHeader(false);
-    if (!access) return viewSetup();
+    if (!access) {
+      app.innerHTML = `
+        <section class="panel login">
+          <p class="eyebrow">🔐 Painel</p>
+          <h1>Painel ainda não configurado</h1>
+          <p class="muted">Quem é dono(a) do site precisa fazer a configuração inicial antes do primeiro login.</p>
+        </section>`;
+      return;
+    }
     app.innerHTML = `
       <section class="panel login">
         <p class="eyebrow">🔐 Entrar</p>
@@ -309,14 +311,8 @@
           <p class="${ok ? "form-ok" : "form-error"}" id="login-msg" ${message ? "" : "hidden"}>${esc(message || "")}</p>
         </form>
         <p class="muted small">Primeiro acesso? Use a senha provisória que você recebeu. Logo depois o painel pede pra você criar a sua.</p>
-        <details class="help">
-          <summary>Sou dono(a) do site</summary>
-          <p class="muted small">Configurar do zero apaga todos os acessos e cria de novo com senha provisória. Pra só trocar a chave do GitHub, entre normalmente e use “Chave do GitHub”.</p>
-          <button type="button" class="btn ghost" id="go-setup">⚙️ Configurar do zero</button>
-        </details>
       </section>`;
 
-    app.querySelector("#go-setup").addEventListener("click", () => viewSetup());
     const form = app.querySelector("#login-form");
     form.login.focus();
     form.addEventListener("submit", async (e) => {
@@ -432,104 +428,143 @@
     return people;
   }
 
-  function viewSetup() {
-    setHeader(false);
-    const g = { branch: "main", ...guessRepo(), ...(access ? { owner: access.owner, repo: access.repo, branch: access.branch } : {}) };
-    app.innerHTML = `
-      <section class="panel login setup">
-        <p class="eyebrow">⚙️ Configuração</p>
-        <h1>Configurar acesso</h1>
-        <p class="muted">Feito uma vez só, por quem é dono(a) do repositório no GitHub. Conecta o painel ao GitHub e cria os usuários com <strong>senha provisória</strong>. No primeiro login cada pessoa cria a própria senha.</p>
-        ${access ? '<p class="form-error">⚠️ Isso substitui todos os acessos atuais.</p>' : ""}
-
-        <form id="setup-form" class="form">
-          <h3>1. Repositório do site</h3>
-          <div class="row">
-            <label>Usuário do GitHub<input name="owner" required value="${esc(g.owner || "")}" placeholder="ex: Proddy-0"></label>
-            <label>Repositório<input name="repo" required value="${esc(g.repo || "")}" placeholder="ex: cantinho-magico"></label>
-          </div>
-          <label>Branch<input name="branch" required value="${esc(g.branch || "main")}"></label>
-
-          <h3>2. Chave do GitHub</h3>
-          <label>Token<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
-          ${tokenHelp()}
-
-          <h3>3. Quem pode entrar</h3>
-          <div id="people">${DEFAULT_PEOPLE.map(personHTML).join("")}</div>
-          <button type="button" class="btn ghost" id="add-person">＋ Adicionar outra pessoa</button>
-
-          <button class="btn primary" type="submit">Salvar acessos</button>
-          <p class="form-error" id="setup-error" hidden></p>
-          ${access ? '<button type="button" class="btn ghost" id="back-login">← Voltar pro login</button>' : ""}
-        </form>
-      </section>`;
-
-    const form = app.querySelector("#setup-form");
-    const people = app.querySelector("#people");
-    if (!form.owner.value) form.owner.value = "Proddy-0";
-    if (!form.repo.value) form.repo.value = "cantinho-magico";
-    app.querySelector("#add-person").addEventListener("click", () => {
-      people.insertAdjacentHTML("beforeend", personHTML({}, people.children.length));
-    });
-    app.querySelector("#back-login")?.addEventListener("click", () => viewLogin());
-
-    form.addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const errEl = app.querySelector("#setup-error");
-      const btn = form.querySelector("button[type=submit]");
-      errEl.hidden = true;
-      let list;
-      try {
-        list = readPeople(people);
-      } catch (err) {
-        errEl.textContent = err.message;
-        errEl.hidden = false;
-        return;
-      }
-      const who = { owner: form.owner.value.trim(), repo: form.repo.value.trim(), branch: form.branch.value.trim() || "main", token: form.token.value.trim() };
-      if (who.token.length > 180) {
-        errEl.textContent = "Esse token é grande demais. Use um Fine-grained token do GitHub.";
-        errEl.hidden = false;
-        return;
-      }
-      btn.disabled = true;
-      try {
-        btn.textContent = "Testando a chave…";
-        const repo = await api("", {}, who);
-        if (repo.permissions && !repo.permissions.push) throw Object.assign(new Error(), { status: 403 });
-
-        const users = [];
-        for (const p of list) {
-          btn.textContent = `Criando acesso de ${p.name}…`;
-          users.push(await makeUser(p, who.token));
-        }
-
-        btn.textContent = "Salvando…";
-        const current = await getFile(ACCESS_PATH, who);
-        const next = { version: 2, owner: who.owner, repo: who.repo, branch: who.branch, users, tokenExposed: true, updated: now() };
-        await putJSON(ACCESS_PATH, next, "Configura acesso ao painel admin", current && current.sha, who);
-        access = next;
-        viewLogin("✅ Acessos criados! Entre com seu usuário e a senha provisória.", true);
-      } catch (err) {
-        errEl.innerHTML = errMsg(err);
-        errEl.hidden = false;
-        btn.disabled = false;
-        btn.textContent = "Salvar acessos";
-      }
-    });
-  }
-
+  // ---------- página do dono do site (setup.html, sem link no site) ----------
   const tokenHelp = () => `
     <details class="help">
       <summary>Como criar a chave</summary>
       <ol>
         <li>Abra <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained token</a>.</li>
-        <li>Nome: <em>painel do blog</em>. Escolha a validade (quando vencer, é só renovar aqui no painel).</li>
-        <li><strong>Repository access</strong> → <em>Only select repositories</em> → o repositório do blog.</li>
+        <li>Nome: <em>painel do blog</em>. Escolha a validade (quando vencer, é só renovar nesta página).</li>
+        <li><strong>Repository access</strong> → <em>Only select repositories</em> → <strong>${esc(REPO.repo || "")}</strong>.</li>
         <li><strong>Permissions → Repository permissions → Contents</strong> → <em>Read and write</em>.</li>
         <li><strong>Generate token</strong>, copie e cole aqui.</li>
       </ol>
     </details>`;
+
+  async function checkToken(token) {
+    if (token.length > 180) throw new Error("Esse token é grande demais. Use um Fine-grained token do GitHub.");
+    const who = { ...REPO, token };
+    const repo = await api("", {}, who);
+    if (repo.permissions && !repo.permissions.push) throw Object.assign(new Error(), { status: 403 });
+    return who;
+  }
+
+  function viewOwner(message) {
+    setHeader(false);
+    subEl.textContent = "Área do dono do site";
+    const users = (access && access.users) || [];
+    const waiting = users.filter((u) => u.mustChange).map((u) => u.name);
+    const advice = !access
+      ? ""
+      : waiting.length
+        ? `<p class="banner">⏳ Aguardando ${esc(waiting.join(" e "))} entrar e criar a própria senha. Depois disso, renove a chave aqui.</p>`
+        : access.tokenExposed
+          ? `<p class="banner warn">🔒 Todo mundo já criou a própria senha. Renove a chave do GitHub agora: assim a senha provisória que ficou no histórico não serve pra mais nada.</p>`
+          : `<p class="form-ok">✅ Tudo certo. Renove a chave só quando ela vencer.</p>`;
+
+    app.innerHTML = `
+      ${message ? `<p class="form-ok owner-msg">${message}</p>` : ""}
+      ${
+        access
+          ? `<section class="panel login setup">
+              <p class="eyebrow">🔑 Chave do GitHub</p>
+              <h1>Renovar chave</h1>
+              <p class="muted">Use quando a chave vencer, ou por segurança. Ninguém precisa trocar de senha.</p>
+              ${advice}
+              <ul class="people-list">${users
+                .map((u) => `<li><span>👤 <strong>${esc(u.name)}</strong></span>${u.mustChange ? '<span class="badge warn">senha provisória</span>' : '<span class="badge on">senha própria</span>'}</li>`)
+                .join("")}</ul>
+              <form id="renew-form" class="form">
+                <label>Nova chave (token)<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
+                ${tokenHelp()}
+                <button class="btn primary" type="submit">Renovar chave</button>
+                <p class="form-error" id="renew-error" hidden></p>
+              </form>
+            </section>`
+          : ""
+      }
+
+      <section class="panel login setup">
+        <p class="eyebrow">⚙️ Configuração</p>
+        <h1>${access ? "Configurar do zero" : "Configuração inicial"}</h1>
+        <p class="muted">Cria os usuários do painel com <strong>senha provisória</strong>. No primeiro login cada pessoa cria a própria senha.</p>
+        ${access ? '<p class="form-error">⚠️ Isso apaga todos os acessos atuais e cria de novo.</p>' : ""}
+        <form id="setup-form" class="form">
+          <div id="people">${DEFAULT_PEOPLE.map(personHTML).join("")}</div>
+          <button type="button" class="btn ghost" id="add-person">＋ Adicionar outra pessoa</button>
+          <label>Chave do GitHub (token)<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
+          ${tokenHelp()}
+          <button class="btn ${access ? "danger" : "primary"}" type="submit">${access ? "Apagar e configurar de novo" : "Salvar acessos"}</button>
+          <p class="form-error" id="setup-error" hidden></p>
+        </form>
+      </section>`;
+
+    const people = app.querySelector("#people");
+    app.querySelector("#add-person").addEventListener("click", () => {
+      people.insertAdjacentHTML("beforeend", personHTML({}, people.children.length));
+    });
+
+    const showErr = (id, err) => {
+      const el = app.querySelector(id);
+      el.innerHTML = err.status || err instanceof TypeError ? errMsg(err) : esc(err.message);
+      el.hidden = false;
+    };
+
+    // Renovar: tranca a chave nova com a chave pública de cada pessoa
+    app.querySelector("#renew-form")?.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const btn = f.querySelector("button[type=submit]");
+      app.querySelector("#renew-error").hidden = true;
+      btn.disabled = true;
+      btn.textContent = "Testando a chave…";
+      try {
+        const who = await checkToken(f.token.value.trim());
+        btn.textContent = "Salvando…";
+        await updateAccess(async (a) => {
+          for (const u of a.users) u.token = await sealToken(u.pub, who.token);
+          a.tokenExposed = a.users.some((u) => u.mustChange);
+        }, "Renova a chave do GitHub do painel", who);
+        store.del(SESSION_KEY);
+        viewOwner("✅ Chave renovada! Agora apague a chave antiga no GitHub (Settings → Developer settings → Fine-grained tokens).");
+      } catch (err) {
+        showErr("#renew-error", err);
+        btn.disabled = false;
+        btn.textContent = "Renovar chave";
+      }
+    });
+
+    app.querySelector("#setup-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const f = e.target;
+      const btn = f.querySelector("button[type=submit]");
+      const label = btn.textContent;
+      app.querySelector("#setup-error").hidden = true;
+      if (access && !confirm("Apagar todos os acessos e configurar de novo?")) return;
+      btn.disabled = true;
+      try {
+        const list = readPeople(people);
+        btn.textContent = "Testando a chave…";
+        const who = await checkToken(f.token.value.trim());
+        const users = [];
+        for (const p of list) {
+          btn.textContent = `Criando acesso de ${p.name}…`;
+          users.push(await makeUser(p, who.token));
+        }
+        btn.textContent = "Salvando…";
+        const current = await getFile(ACCESS_PATH, who);
+        const next = { version: 2, owner: who.owner, repo: who.repo, branch: who.branch, users, tokenExposed: true, updated: now() };
+        await putJSON(ACCESS_PATH, next, "Configura acesso ao painel admin", current && current.sha, who);
+        access = next;
+        store.del(SESSION_KEY);
+        viewOwner(`✅ Acessos criados! Em ~1 minuto já dá pra entrar em <a href="admin.html">admin.html</a> com o usuário e a senha provisória.`);
+      } catch (err) {
+        showErr("#setup-error", err);
+        btn.disabled = false;
+        btn.textContent = label;
+      }
+    });
+  }
 
   // ---------- painel ----------
   async function openDashboard() {
@@ -556,7 +591,6 @@
 
   function renderDashboard() {
     app.innerHTML = `
-      <div id="security-banner"></div>
       <div class="admin-grid">
         <section class="panel">
           <form id="editor" class="form" autocomplete="off">
@@ -669,16 +703,6 @@
             <button type="submit" class="btn">Salvar nova senha</button>
           </form>
         </details>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head"><h2>🔑 Chave do GitHub</h2></div>
-        <p class="muted small">Quando a chave vencer (ou por segurança), crie uma nova no GitHub e cole aqui. Ninguém precisa trocar de senha.</p>
-        <form id="token-form" class="form">
-          <label>Nova chave (token)<input name="token" type="password" required autocomplete="off" placeholder="github_pat_..."></label>
-          ${tokenHelp()}
-          <div class="actions"><button type="submit" class="btn">Renovar chave</button></div>
-        </form>
       </section>`;
 
     const form = app.querySelector("#editor");
@@ -764,7 +788,6 @@
     app.querySelector("#launch-form").addEventListener("input", renderLaunchInfo);
     app.querySelector("#person-form").addEventListener("submit", addPerson);
     app.querySelector("#mypass-form").addEventListener("submit", changeMyPassword);
-    app.querySelector("#token-form").addEventListener("submit", renewToken);
     app.querySelector("#people-list").addEventListener("click", (e) => {
       const b = e.target.closest("button[data-id]");
       if (!b) return;
@@ -823,18 +846,6 @@
         </li>`
         )
         .join("") || '<li class="muted">Ninguém configurado.</li>';
-    renderBanner();
-  }
-
-  // Depois que todo mundo trocou a senha provisória, pede pra renovar a chave do GitHub uma vez
-  function renderBanner() {
-    const users = (access && access.users) || [];
-    const waiting = users.filter((u) => u.mustChange).map((u) => u.name);
-    const el = app.querySelector("#security-banner");
-    if (!access || !access.tokenExposed) return (el.innerHTML = "");
-    el.innerHTML = waiting.length
-      ? `<div class="banner">⏳ Aguardando ${esc(waiting.join(" e "))} entrar e criar a própria senha. Depois disso, renove a chave do GitHub (lá embaixo) pra concluir a segurança.</div>`
-      : `<div class="banner warn">🔒 Todo mundo já criou a própria senha! Último passo: <a href="#token-form">renove a chave do GitHub</a>. Assim a senha provisória que ficou no histórico do site não serve pra mais nada.</div>`;
   }
 
   // ---------- cronômetro de lançamento ----------
@@ -991,38 +1002,6 @@
     } finally {
       btn.disabled = false;
       btn.textContent = "Salvar nova senha";
-    }
-  }
-
-  // Tranca o token novo com a chave pública de cada pessoa (ninguém precisa trocar de senha)
-  async function renewToken(e) {
-    e.preventDefault();
-    const f = e.target;
-    const btn = f.querySelector("button[type=submit]");
-    const token = f.token.value.trim();
-    if (token.length > 180) return toast("Esse token é grande demais. Use um Fine-grained token.", "error");
-    btn.disabled = true;
-    btn.textContent = "Testando…";
-    try {
-      const who = { ...session, token };
-      const repo = await api("", {}, who);
-      if (repo.permissions && !repo.permissions.push) throw Object.assign(new Error(), { status: 403 });
-      btn.textContent = "Salvando…";
-      await updateAccess(async (a) => {
-        for (const u of a.users) u.token = await sealToken(u.pub, token);
-        a.tokenExposed = a.users.some((u) => u.mustChange);
-      }, "Renova a chave do GitHub do painel", who);
-      let remembered = false;
-      try { remembered = !!localStorage.getItem(SESSION_KEY); } catch (x) {}
-      startSession({ ...session, token }, remembered);
-      f.reset();
-      renderPeople();
-      toast("✅ Chave renovada! Agora apague a chave antiga no GitHub (Settings → Developer settings → Fine-grained tokens).", "ok", 12000);
-    } catch (err) {
-      toast(errMsg(err), "error", 9000);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "Renovar chave";
     }
   }
 
@@ -1292,12 +1271,13 @@
   });
 
   async function init() {
-    document.title = `Admin · ${SITE.name}`;
+    document.title = `${PAGE === "setup" ? "Configuração" : "Admin"} · ${SITE.name}`;
     if (!window.crypto || !crypto.subtle) {
       app.innerHTML = `<p class="loading">⚠️ Abra o painel pelo endereço com <strong>https://</strong> para o login funcionar.</p>`;
       return;
     }
     access = await loadAccess();
+    if (PAGE === "setup") return viewOwner();
     session = store.get(SESSION_KEY);
     if (session && session.token) openDashboard();
     else viewLogin();

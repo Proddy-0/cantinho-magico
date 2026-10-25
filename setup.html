@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Configuração</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚙️</text></svg>">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<!-- Página do dono do site: configuração inicial e renovação da chave do GitHub. Não tem link no site. -->
+<body class="admin" data-page="setup">
+  <header class="topbar">
+    <a class="brand" href="./"><span>⚙️ Configuração</span><small id="admin-sub">Área do dono do site</small></a>
+    <nav class="nav">
+      <a href="admin.html">Painel →</a>
+      <a href="#" id="logout" hidden>Sair</a>
+    </nav>
+  </header>
+
+  <main id="admin-app"></main>
+
+  <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+  <script src="js/config.js"></script>
+  <script src="js/markdown.js"></script>
+  <script src="js/admin.js"></script>
+</body>
+</html>

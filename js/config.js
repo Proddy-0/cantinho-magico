@@ -23,6 +23,9 @@ Aqui você vai encontrar reviews, listas, guias pra quem está começando e muit
 > Fã-site pessoal, sem fins lucrativos e sem vínculo oficial com The Walt Disney Company, BIGHIT MUSIC/HYBE ou Formula 1.
 `,
 
+  // Repositório onde o painel admin salva os posts
+  github: { owner: "Proddy-0", repo: "cantinho-magico", branch: "main" },
+
   /*
     🎨 CATEGORIAS
     O ícone pode ser um emoji ("💜") OU uma imagem PNG/SVG enviada pro site

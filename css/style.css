@@ -602,6 +602,10 @@ body.admin main { max-width: 1240px; }
 .banner.warn { background: #fef0c7; border-color: #f79009; color: #7a2e0e; }
 .banner a { color: inherit; }
 .people-list .pl-actions { flex-wrap: wrap; justify-content: flex-end; }
+.owner-msg { max-width: 640px; margin: 24px auto -8px; }
+.owner-msg a, .form-ok a { color: inherit; }
+.setup .people-list { margin: 14px 0; }
+.nav a.nav-admin { color: var(--bts); border: 1.5px solid var(--bts); }
 
 .toast {
   position: fixed;

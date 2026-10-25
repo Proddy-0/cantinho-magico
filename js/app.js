@@ -308,6 +308,14 @@
     window.scrollTo(0, 0);
   }
 
+  // O link do painel só aparece pra quem está logado no admin neste navegador
+  function loggedIn() {
+    for (const s of ["sessionStorage", "localStorage"]) {
+      try { if (window[s].getItem("admin-session")) return true; } catch (e) {}
+    }
+    return false;
+  }
+
   async function loadSiteSettings() {
     try {
       const r = await fetch("data/site.json", { cache: "no-cache" });
@@ -336,9 +344,10 @@
       <a href="#/" data-nav="home">Início</a>
       <a href="#/blog" data-nav="blog">Blog</a>
       ${Object.keys(CATS).map((k) => `<a href="#/blog/${k}" data-nav="${k}">${catTag(k)}</a>`).join("")}
-      <a href="#/sobre" data-nav="sobre">Sobre</a>`;
+      <a href="#/sobre" data-nav="sobre">Sobre</a>
+      ${loggedIn() ? '<a href="admin.html" class="nav-admin">✏️ Admin</a>' : ""}`;
     document.getElementById("footer-text").innerHTML =
-      `Feito com 💜 · ${esc(SITE.name)} © ${new Date().getFullYear()} · Fã-site sem vínculo oficial com Disney, BTS/HYBE ou Formula 1. · <a href="admin.html">Admin</a>`;
+      `Feito com 💜 · ${esc(SITE.name)} © ${new Date().getFullYear()} · Fã-site sem vínculo oficial com Disney, BTS/HYBE ou Formula 1.`;
 
     await loadSiteSettings();
     if (!launched() && !preview) return viewLaunch();

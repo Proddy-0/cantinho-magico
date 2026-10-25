@@ -13,7 +13,8 @@ Site 100% estático (HTML + CSS + JS) no **GitHub Pages**, com domínio próprio
 
 ```
 index.html        → o site
-admin.html        → painel admin
+admin.html        → painel admin (login com usuário e senha)
+setup.html        → configuração inicial e renovação da chave do GitHub (só o dono, sem link no site)
 CNAME             → domínio (baiana.proddyt.com)
 data/posts.json   → os posts (o painel edita sozinho)
 data/site.json    → cronômetro de lançamento (o painel edita sozinho)
@@ -37,18 +38,20 @@ git push
 
 ## ✏️ Painel admin
 
-Acesse **https://baiana.proddyt.com/admin.html** (link "Admin" no rodapé do site).
+Acesse **https://baiana.proddyt.com/admin.html**. O site não mostra link pro painel pra visitantes: o link **✏️ Admin** só aparece no menu pra quem está logado.
 
-### Configuração inicial (dono do repositório, uma vez só)
+### Configuração inicial (dono do site, uma vez só)
 
-Na primeira vez, o `admin.html` mostra **Configurar acesso**, já preenchido com os usuários **aysllan** e **bia** e a senha provisória **123mudar**:
+Fica numa página separada, sem link no site: **https://baiana.proddyt.com/setup.html**. Já vem preenchida com os usuários **aysllan** e **bia** e a senha provisória **123mudar**.
 
 1. Crie uma chave em [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new):
    - **Repository access** → *Only select repositories* → `cantinho-magico`
    - **Permissions → Repository permissions → Contents** → *Read and write*
-2. Cole a chave e clique em **Salvar acessos**.
-3. Cada pessoa entra com o usuário e `123mudar`. **No primeiro login o painel pede uma senha nova**, que fica registrada.
-4. Quando todo mundo tiver criado a própria senha, o painel avisa: renove a chave do GitHub em **🔑 Chave do GitHub** (crie uma nova, cole, e apague a antiga no GitHub).
+2. Cole a chave no `setup.html` e clique em **Salvar acessos**.
+3. Cada pessoa entra no `admin.html` com o usuário e `123mudar`. **No primeiro login o painel pede uma senha nova**, que fica registrada.
+4. Quando todo mundo tiver criado a própria senha, o `setup.html` avisa: renove a chave do GitHub lá (crie uma nova, cole, e apague a antiga no GitHub).
+
+O repositório (`Proddy-0/cantinho-magico`) fica fixo em `js/config.js` → `github`.
 
 ### Como fica seguro sem servidor
 
@@ -64,8 +67,9 @@ Na primeira vez, o `admin.html` mostra **Configurar acesso**, já preenchido com
 - escolher a **capa**: emoji, **figurinha PNG** (fundo transparente, centralizada) ou **foto**,
 - usar **negrito**, título, lista, citação, link, **imagem** e **vídeo do YouTube**,
 - **🚀 Cronômetro de lançamento**: ligar/desligar, data e hora de abertura (horário de Brasília), título e mensagem,
-- **👥 Quem pode entrar**: adicionar pessoa (com senha provisória), resetar senha, remover, trocar a própria senha,
-- **🔑 Chave do GitHub**: renovar.
+- **👥 Quem pode entrar**: adicionar pessoa (com senha provisória), resetar senha, remover, trocar a própria senha.
+
+A chave do GitHub não aparece no painel: configuração e renovação ficam só no `setup.html`.
 
 ## 🚀 Cronômetro de lançamento
 
